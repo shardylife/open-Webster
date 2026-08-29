@@ -1,8 +1,8 @@
 """
 title: Production Prompt Enhancer
 author: bezz
-version: 4.9.0
-description: Intent-aware LLM-based filter that enhances user prompts for better responses. Enhancement is opt-in per message via an activation prefix (!! by default — only prefixed messages are enhanced, and the prefix is stripped before sending; a legacy 'bypass' mode inverts this to always-on). Inline per-message flags (!!d,show: prompt) override style, force the comparison card, or skip the cache; !!help shows a command card. A failure circuit breaker pauses enhancement after repeated LLM failures so users never pay serial timeouts. Also features per-user overrides, context-aware TTL caching (optionally shared across users), request coalescing, config-driven intents, enhancement style modes, opt-in Socratic mode (asks one clarifying question when a prompt is too vague to enhance), model skip-lists, LLM timeouts, image-aware enhancement, multilingual skip heuristics (EN/ES/FR/DE/PT/IT + CJK), admin !!stats / !!stats reset commands, an optional expansion guard, original-prompt preservation, and smart skip logic (including already-well-structured prompts).
+version: 4.10.0
+description: Intent-aware LLM-based filter that enhances user prompts for better responses. Enhancement is opt-in per message via an activation prefix (!! by default — only prefixed messages are enhanced, and the prefix is stripped before sending; a legacy 'bypass' mode inverts this to always-on). !!on / !!off toggle automatic enhancement for the current chat, and users can override the mode for themselves via a per-user valve. Inline per-message flags (!!d,show: prompt) override style, force the comparison card, or skip the cache (fresh also retries a paused enhancer); !!help shows a command card. A failure circuit breaker pauses enhancement after repeated LLM failures so users never pay serial timeouts. Also features per-user overrides, context-aware TTL caching (optionally shared across users), request coalescing, config-driven intents, enhancement style modes, opt-in Socratic mode (asks one clarifying question when a prompt is too vague to enhance), model skip-lists, LLM timeouts, image-aware enhancement, multilingual skip heuristics (EN/ES/FR/DE/PT/IT + CJK), admin !!stats / !!stats reset commands (with last-failure readout), an optional expansion guard, original-prompt preservation, and smart skip logic (including already-well-structured prompts).
 required_open_webui_version: 0.9.1
 """
 
@@ -104,10 +104,24 @@ class _Stats:
         self._lock = threading.Lock()
         self._counts: dict[str, int] = {key: 0 for key in self.KEYS}
         self._started = time.monotonic()
+        self._last_failure: Optional[tuple[str, float]] = None
 
     def bump(self, key: str, amount: int = 1) -> None:
         with self._lock:
             self._counts[key] = self._counts.get(key, 0) + amount
+
+    def note_failure(self, reason: str) -> None:
+        """Remember the most recent failure reason for the admin stats card."""
+        with self._lock:
+            self._last_failure = (str(reason)[:200], time.monotonic())
+
+    def last_failure(self) -> Optional[tuple[str, float]]:
+        """(reason, age_seconds) of the most recent failure, or None."""
+        with self._lock:
+            if self._last_failure is None:
+                return None
+            reason, stamp = self._last_failure
+            return reason, max(0.0, time.monotonic() - stamp)
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
@@ -121,6 +135,7 @@ class _Stats:
             for key in self._counts:
                 self._counts[key] = 0
             self._started = time.monotonic()
+            self._last_failure = None
 
 
 _STATS = _Stats()
@@ -167,8 +182,64 @@ class _FailureBreaker:
 _breaker = _FailureBreaker()
 
 
+class _ChatToggles:
+    """Per-chat automatic-enhancement overrides ('!!on' / '!!off').
+
+    LRU-bounded with TTL so abandoned chats age out. In-memory and
+    per-process: overrides reset on restart and are not shared between
+    workers in a multi-worker deployment — a convenience toggle, not
+    durable configuration.
+    """
+
+    def __init__(self, maxsize: int = 512, ttl_seconds: float = 24 * 3600.0) -> None:
+        self._entries: "OrderedDict[str, tuple[bool, float]]" = OrderedDict()
+        self._maxsize = max(1, int(maxsize))
+        self._ttl = max(0.0, float(ttl_seconds))
+        self._lock = threading.Lock()
+
+    def set(self, chat_id: str, enabled: bool) -> None:
+        with self._lock:
+            self._entries[chat_id] = (enabled, time.monotonic())
+            self._entries.move_to_end(chat_id)
+            while len(self._entries) > self._maxsize:
+                self._entries.popitem(last=False)
+
+    def get(self, chat_id: str) -> Optional[bool]:
+        if not chat_id:
+            return None
+        with self._lock:
+            entry = self._entries.get(chat_id)
+            if entry is None:
+                return None
+            enabled, stamp = entry
+            if self._ttl > 0 and (time.monotonic() - stamp) > self._ttl:
+                self._entries.pop(chat_id, None)
+                return None
+            self._entries.move_to_end(chat_id)
+            return enabled
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+
+_chat_toggles = _ChatToggles()
+
+
+def _fmt_ago(seconds: float) -> str:
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    if seconds < 90 * 60:
+        return f"{int(seconds / 60)}m"
+    return f"{seconds / 3600.0:.1f}h"
+
+
 def _stats_summary() -> str:
     counts = _STATS.snapshot()
+    last = _STATS.last_failure()
+    failure_bit = (
+        f" | last failure: {last[0]} ({_fmt_ago(last[1])} ago)" if last else ""
+    )
     return (
         f"enhanced: {counts['enhanced']} | cache hits: {counts['cache_hits']} | "
         f"skipped: {counts['skipped']} | bypassed: {counts['bypassed']} | "
@@ -176,7 +247,7 @@ def _stats_summary() -> str:
         f"timeouts: {counts['timeouts']} | socratic: {counts['socratic']} | "
         f"cooldown skips: {counts['cooldown']} | "
         f"cache entries: {len(_prompt_cache)} | "
-        f"uptime: {_STATS.uptime_hours():.1f}h"
+        f"uptime: {_STATS.uptime_hours():.1f}h{failure_bit}"
     )
 
 
@@ -339,6 +410,7 @@ _FULL_FENCE_RE = re.compile(
 _ARTIFACT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"^\s*(?:enhanced\s+prompt|refined\s+prompt|improved\s+prompt|"
+        r"prompt\s+to\s+enhance|"
         r"here(?:'s| is) (?:the |your )?(?:enhanced|refined|improved) "
         r"(?:prompt|version))[\s:]*",
         re.IGNORECASE,
@@ -391,6 +463,13 @@ def _clean_llm_output(text: str) -> str:
 
     for pattern in _ARTIFACT_PATTERNS:
         cleaned = pattern.sub("", cleaned).strip()
+
+    # The enhancement request wraps the prompt in triple quotes; some models
+    # echo those delimiters around their whole output.
+    if cleaned.startswith('"""') and cleaned.endswith('"""') and len(cleaned) > 6:
+        inner = cleaned[3:-3].strip()
+        if inner:
+            cleaned = inner
 
     for opener, closer in _QUOTE_PAIRS:
         if len(cleaned) > 2 and cleaned.startswith(opener) and cleaned.endswith(closer):
@@ -1685,6 +1764,7 @@ def _chip(label: str) -> str:
 
 def _stats_embed_html() -> str:
     counts = _STATS.snapshot()
+    last = _STATS.last_failure()
     rows: tuple[tuple[str, Any], ...] = (
         ("Enhanced", counts["enhanced"]),
         ("Cache hits", counts["cache_hits"]),
@@ -1696,6 +1776,8 @@ def _stats_embed_html() -> str:
         ("Socratic questions", counts["socratic"]),
         ("Cooldown skips", counts["cooldown"]),
         ("Cache entries", len(_prompt_cache)),
+        ("Chat overrides", len(_chat_toggles)),
+        ("Last failure", f"{last[0]} · {_fmt_ago(last[1])} ago" if last else "—"),
         ("Uptime (hours)", f"{_STATS.uptime_hours():.1f}"),
     )
     cells = "".join(
@@ -1717,7 +1799,9 @@ def _stats_embed_html() -> str:
     )
 
 
-def _help_embed_html(prefix: str, mode: str, style: str, is_admin: bool) -> str:
+def _help_embed_html(
+    prefix: str, mode: str, style: str, is_admin: bool, chat_toggle: bool
+) -> str:
     rows: list[tuple[str, str]] = []
     if mode == "activate":
         rows.append((f"{prefix}<prompt>", "Enhance this message (prefix stripped before sending)"))
@@ -1727,13 +1811,16 @@ def _help_embed_html(prefix: str, mode: str, style: str, is_admin: bool) -> str:
                 (f"{prefix}s: <prompt>", "Standard style for this message (or 'standard:')"),
                 (f"{prefix}d: <prompt>", "Detailed style for this message (or 'detailed:')"),
                 (f"{prefix}show: <prompt>", "Also display the before/after comparison card"),
-                (f"{prefix}fresh: <prompt>", "Ignore any cached result and re-enhance"),
+                (f"{prefix}fresh: <prompt>", "Ignore any cached result and re-enhance (also retries a paused enhancer)"),
                 (f"{prefix}d,show: <prompt>", "Flags combine with commas"),
             ]
         )
     else:
         rows.append(("<prompt>", "Every message is enhanced automatically"))
         rows.append((f"{prefix}<prompt>", "Send this message WITHOUT enhancement"))
+    if chat_toggle:
+        rows.append((f"{prefix}on", "Enhance every message in this chat automatically"))
+        rows.append((f"{prefix}off", "Stop automatic enhancement in this chat"))
     rows.append((f"{prefix}help", "Show this help"))
     if is_admin:
         rows.append((f"{prefix}stats / {prefix}stats reset", "Runtime counters / reset (admin)"))
@@ -1965,6 +2052,15 @@ class Filter:
                 "available regardless of this setting."
             ),
         )
+        enable_chat_toggle: bool = Field(
+            default=True,
+            description=(
+                "Allow '<prefix>on' / '<prefix>off' to toggle automatic "
+                "enhancement for the current chat. Overrides are in-memory "
+                "(reset on restart, per worker process) and expire after 24h "
+                "of inactivity."
+            ),
+        )
         failure_threshold: int = Field(
             default=3,
             ge=0,
@@ -2165,6 +2261,15 @@ class Filter:
                 "'concise', 'standard', or 'detailed'. Leave empty to use admin default."
             ),
         )
+        prefix_mode: Optional[str] = Field(
+            default=None,
+            description=(
+                "Override the prefix mode for your messages: 'activate' "
+                "(enhance only prefixed messages) or 'bypass' (enhance "
+                "everything except prefixed messages). Leave empty to use "
+                "the admin default."
+            ),
+        )
         show_enhanced_prompt: Optional[bool] = Field(
             default=None,
             description=(
@@ -2342,6 +2447,20 @@ class Filter:
             return bool(user_valves.get("enabled", True))
         return bool(getattr(user_valves, "enabled", True))
 
+    def _effective_mode(self, user_valves: Any) -> str:
+        """Admin prefix_mode, unless the user set a valid per-user override."""
+        mode: str = self.valves.prefix_mode
+        if isinstance(user_valves, dict):
+            uv_mode = user_valves.get("prefix_mode")
+        else:
+            uv_mode = getattr(user_valves, "prefix_mode", None)
+        if isinstance(uv_mode, str) and uv_mode.strip().lower() in (
+            "activate",
+            "bypass",
+        ):
+            mode = uv_mode.strip().lower()
+        return mode
+
     def _should_skip(
         self, user_message: str, *, followup: bool, explicit: bool = False
     ) -> Optional[str]:
@@ -2382,6 +2501,8 @@ class Filter:
         user_message: str,
         user_info: Optional[dict],
         emitter: Optional[Callable[[Any], Awaitable[None]]],
+        mode: str,
+        chat_id: str,
     ) -> Optional[_PrefixOutcome]:
         """Apply the per-message prefix, inline flags, and utility commands.
 
@@ -2395,19 +2516,26 @@ class Filter:
         - 'bypass' mode (legacy): every message is enhanced except prefixed
           ones, which are stripped and forwarded as-is.
 
-        The stats and help commands work in both modes and raise to abort the
-        request so they never reach the model.
+        A per-chat '<prefix>on' / '<prefix>off' override flips what happens
+        to UNPREFIXED messages in that chat; the prefix itself always keeps
+        its mode meaning. The stats/help/on/off commands work in both modes
+        and raise to abort the request so they never reach the model.
         """
         prefix = self.valves.prefix.strip()
-        activate = self.valves.prefix_mode == "activate"
+        activate = mode == "activate"
+        # Chat override changes the automatic (unprefixed) behavior only.
+        override = _chat_toggles.get(chat_id) if self.valves.enable_chat_toggle else None
+        auto_enhance = override if override is not None else not activate
+        passthrough = _PrefixOutcome(text=user_message) if auto_enhance else None
+
         if not prefix:
             # No prefix configured: nothing can trigger opt-in enhancement;
-            # legacy mode simply enhances everything.
-            return None if activate else _PrefixOutcome(text=user_message)
+            # automatic mode simply enhances everything.
+            return passthrough
 
         leading = user_message.lstrip()
         if not leading.startswith(prefix):
-            return None if activate else _PrefixOutcome(text=user_message)
+            return passthrough
 
         remainder = leading[len(prefix) :].lstrip()
         command = " ".join(remainder.lower().split())
@@ -2433,18 +2561,47 @@ class Filter:
             # the exception text doubles as a plain-text stats readout.
             raise RuntimeError(f"{label} — {_stats_summary()}")
 
+        if command in ("on", "off") and self.valves.enable_chat_toggle:
+            if not chat_id:
+                raise RuntimeError(
+                    "Prompt Enhancer: couldn't identify this chat — the "
+                    "per-chat toggle isn't available here."
+                )
+            _chat_toggles.set(chat_id, command == "on")
+            if command == "on":
+                raise RuntimeError(
+                    "Prompt Enhancer: automatic enhancement is ON for this "
+                    f"chat. Send '{prefix}off' to turn it off."
+                )
+            raise RuntimeError(
+                "Prompt Enhancer: automatic enhancement is OFF for this chat. "
+                + (
+                    f"Prefix a message with '{prefix}' to enhance it, or send "
+                    f"'{prefix}on' to turn automatic enhancement back on."
+                    if activate
+                    else f"Send '{prefix}on' to turn it back on."
+                )
+            )
+
         if command == "help" and self.valves.enable_inline_commands:
             user_valves = user_info.get("valves") if user_info else None
             style, _ = self._resolve_user_overrides(user_valves)
             await self._emit_html(
                 emitter,
-                _help_embed_html(prefix, self.valves.prefix_mode, style, is_admin),
+                _help_embed_html(
+                    prefix,
+                    mode,
+                    style,
+                    is_admin,
+                    self.valves.enable_chat_toggle and bool(chat_id),
+                ),
             )
             # Plain-text fallback for clients that don't render the embed.
             raise RuntimeError(
                 f"Prompt Enhancer commands: '{prefix}<prompt>' enhance | "
                 f"'{prefix}c:/s:/d: <prompt>' style | '{prefix}show: <prompt>' "
                 f"comparison card | '{prefix}fresh: <prompt>' skip cache | "
+                f"'{prefix}on'/'{prefix}off' auto-enhance this chat | "
                 f"'{prefix}stats' counters (admin). Flags combine: "
                 f"'{prefix}d,show: <prompt>'."
             )
@@ -2541,6 +2698,22 @@ class Filter:
     # Main entry point
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_chat_id(
+        metadata: Optional[dict], chat_id_param: Optional[str]
+    ) -> str:
+        """Best-effort chat identity for the per-chat toggle.
+
+        Different builds inject __chat_id__ and/or __metadata__; fall back
+        gracefully so the toggle degrades to 'unavailable' rather than
+        breaking anything.
+        """
+        if chat_id_param:
+            return str(chat_id_param)
+        if isinstance(metadata, dict) and metadata.get("chat_id"):
+            return str(metadata["chat_id"])
+        return ""
+
     async def inlet(
         self,
         body: dict,
@@ -2549,6 +2722,8 @@ class Filter:
         __model__: Optional[dict] = None,
         __task__: Optional[str] = None,
         __request__: Optional[Request] = None,
+        __metadata__: Optional[dict] = None,
+        __chat_id__: Optional[str] = None,
     ) -> dict:
         if not self.valves.enabled:
             return body
@@ -2587,7 +2762,13 @@ class Filter:
 
         # --- Per-message prefix (activate/bypass), flags, utility commands ---
         prefixed = await self._resolve_prefix(
-            body, messages, user_message, __user__, __event_emitter__
+            body,
+            messages,
+            user_message,
+            __user__,
+            __event_emitter__,
+            mode=self._effective_mode(user_valves),
+            chat_id=self._resolve_chat_id(__metadata__, __chat_id__),
         )
         if prefixed is None:
             return body
@@ -2771,6 +2952,7 @@ class Filter:
             well_structured=well_structured,
             active_intents=active_intents,
             explicit=explicit,
+            fresh=prefixed.skip_cache,
             user_info=__user__,
             request=__request__,
             emitter=__event_emitter__,
@@ -2829,13 +3011,16 @@ class Filter:
         well_structured: bool,
         active_intents: Sequence[str],
         explicit: bool,
+        fresh: bool,
         user_info: Optional[dict],
         request: Optional[Request],
         emitter: Optional[Callable[[Any], Awaitable[None]]],
     ) -> dict:
         # Circuit breaker: after repeated LLM failures, forward originals
         # instantly instead of making every message pay the full timeout.
-        cooldown_left = _breaker.remaining()
+        # An explicit 'fresh' flag punches through — a deliberate escape
+        # hatch for probing whether the enhancer has recovered.
+        cooldown_left = 0.0 if fresh else _breaker.remaining()
         if cooldown_left > 0:
             _STATS.bump("cooldown")
             logger.debug(
@@ -2903,6 +3088,7 @@ class Filter:
             raw = await self._call_llm_with_retry(request, payload, user)
             if raw is None:
                 outcome["why"] = "enhancer model failed or timed out"
+                _STATS.note_failure(outcome["why"])
                 _breaker.record_failure(
                     self.valves.failure_threshold,
                     float(self.valves.failure_cooldown_seconds),
@@ -2912,6 +3098,7 @@ class Filter:
             cleaned = _clean_llm_output(raw)
             if not cleaned.strip():
                 outcome["why"] = "enhancer returned empty output (possible refusal)"
+                _STATS.note_failure(outcome["why"])
                 _breaker.record_failure(
                     self.valves.failure_threshold,
                     float(self.valves.failure_cooldown_seconds),
@@ -3006,6 +3193,7 @@ class Filter:
             raise
         except Exception as exc:  # noqa: BLE001 - never break the user's chat
             _STATS.bump("failed")
+            _STATS.note_failure(f"unexpected error: {exc}")
             logger.exception("Enhancement failed: %s", exc)
             await self._emit_status(
                 emitter,
