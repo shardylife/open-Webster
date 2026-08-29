@@ -1,5 +1,11 @@
 # Code Review — Production Prompt Enhancer v4.7.0
 
+> **Update:** findings 1–5 below are fixed in v4.8.0
+> (`docs/prompt_enhancer.py` in this branch), which also inverts the prefix
+> semantics: `!!` now *activates* enhancement per message (new `prefix_mode`
+> valve, default `"activate"`; the pre-4.8 always-on behavior remains
+> available as `"bypass"`).
+
 Review of the Open WebUI filter function "Production Prompt Enhancer" (v4.7.0,
 `required_open_webui_version: 0.9.1`), verified against this repository's
 backend (Open WebUI 0.11.1).
