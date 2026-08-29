@@ -1,8 +1,8 @@
 """
 title: Production Prompt Enhancer
 author: bezz
-version: 4.8.0
-description: Intent-aware LLM-based filter that enhances user prompts for better responses. Enhancement is opt-in per message via an activation prefix (!! by default — only prefixed messages are enhanced, and the prefix is stripped before sending; a legacy 'bypass' mode inverts this to always-on). Features per-user overrides, context-aware TTL caching (optionally shared across users), request coalescing, config-driven intents, enhancement style modes, opt-in Socratic mode (asks one clarifying question when a prompt is too vague to enhance), model skip-lists, LLM timeouts, image-aware enhancement, multilingual skip heuristics (EN/ES/FR/DE/PT/IT + CJK), admin !!stats / !!stats reset commands, an optional expansion guard, original-prompt preservation, and smart skip logic (including already-well-structured prompts).
+version: 4.9.0
+description: Intent-aware LLM-based filter that enhances user prompts for better responses. Enhancement is opt-in per message via an activation prefix (!! by default — only prefixed messages are enhanced, and the prefix is stripped before sending; a legacy 'bypass' mode inverts this to always-on). Inline per-message flags (!!d,show: prompt) override style, force the comparison card, or skip the cache; !!help shows a command card. A failure circuit breaker pauses enhancement after repeated LLM failures so users never pay serial timeouts. Also features per-user overrides, context-aware TTL caching (optionally shared across users), request coalescing, config-driven intents, enhancement style modes, opt-in Socratic mode (asks one clarifying question when a prompt is too vague to enhance), model skip-lists, LLM timeouts, image-aware enhancement, multilingual skip heuristics (EN/ES/FR/DE/PT/IT + CJK), admin !!stats / !!stats reset commands, an optional expansion guard, original-prompt preservation, and smart skip logic (including already-well-structured prompts).
 required_open_webui_version: 0.9.1
 """
 
@@ -97,6 +97,7 @@ class _Stats:
         "rejected",
         "timeouts",
         "socratic",
+        "cooldown",
     )
 
     def __init__(self) -> None:
@@ -125,6 +126,47 @@ class _Stats:
 _STATS = _Stats()
 
 
+class _FailureBreaker:
+    """Cooldown circuit breaker for the enhancement LLM.
+
+    After N consecutive failures (errors, timeouts, empty output) the breaker
+    opens for a cooldown window during which enhancement is skipped instantly
+    instead of making every message pay the full LLM timeout again. Any
+    successful enhancement closes it. Thread-safe; monotonic clock.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._consecutive = 0
+        self._open_until = 0.0
+
+    def record_failure(self, threshold: int, cooldown_seconds: float) -> None:
+        with self._lock:
+            self._consecutive += 1
+            if (
+                threshold > 0
+                and cooldown_seconds > 0
+                and self._consecutive >= threshold
+            ):
+                self._open_until = time.monotonic() + cooldown_seconds
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive = 0
+            self._open_until = 0.0
+
+    def remaining(self) -> float:
+        """Seconds the breaker stays open; 0.0 when closed."""
+        with self._lock:
+            return max(0.0, self._open_until - time.monotonic())
+
+    def reset(self) -> None:
+        self.record_success()
+
+
+_breaker = _FailureBreaker()
+
+
 def _stats_summary() -> str:
     counts = _STATS.snapshot()
     return (
@@ -132,6 +174,7 @@ def _stats_summary() -> str:
         f"skipped: {counts['skipped']} | bypassed: {counts['bypassed']} | "
         f"failed: {counts['failed']} | rejected: {counts['rejected']} | "
         f"timeouts: {counts['timeouts']} | socratic: {counts['socratic']} | "
+        f"cooldown skips: {counts['cooldown']} | "
         f"cache entries: {len(_prompt_cache)} | "
         f"uptime: {_STATS.uptime_hours():.1f}h"
     )
@@ -1219,6 +1262,68 @@ _SOCRATIC_DIRECTIVE = (
 
 
 # ---------------------------------------------------------------------------
+# Prefix commands — per-message flags and the outcome of prefix resolution
+# ---------------------------------------------------------------------------
+
+_STYLE_FLAGS: dict[str, str] = {
+    "c": "concise",
+    "concise": "concise",
+    "s": "standard",
+    "standard": "standard",
+    "d": "detailed",
+    "detailed": "detailed",
+}
+_FLAG_HEAD_MAX_CHARS = 32
+
+
+def _parse_inline_flags(text: str) -> tuple[Optional[str], bool, bool, str]:
+    """Parse an optional '<flags>: <prompt>' header from a triggered message.
+
+    Returns (style_override, force_embed, skip_cache, prompt). The header is
+    only honored when EVERY token before the first ':' is a known flag —
+    otherwise the colon belongs to the prompt ("Summarize this: ...") and the
+    text is returned untouched. The head-length cap keeps a long prompt that
+    merely contains a colon from being scanned as a flag list.
+    """
+    head, sep, rest = text.partition(":")
+    if not sep or len(head) > _FLAG_HEAD_MAX_CHARS:
+        return None, False, False, text
+
+    tokens = [t for t in re.split(r"[\s,+]+", head.strip().lower()) if t]
+    if not tokens:
+        return None, False, False, text
+
+    style: Optional[str] = None
+    show = fresh = False
+    for token in tokens:
+        if token in _STYLE_FLAGS:
+            style = _STYLE_FLAGS[token]
+        elif token == "show":
+            show = True
+        elif token == "fresh":
+            fresh = True
+        else:
+            return None, False, False, text
+    return style, show, fresh, rest.lstrip()
+
+
+@dataclass(frozen=True)
+class _PrefixOutcome:
+    """What prefix resolution decided for this message.
+
+    `explicit` marks a message the user deliberately triggered (activate
+    mode): those relax the length/follow-up skip gates and always get a
+    visible status when enhancement can't run.
+    """
+
+    text: str
+    explicit: bool = False
+    style_override: Optional[str] = None
+    force_embed: bool = False
+    skip_cache: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
@@ -1589,6 +1694,7 @@ def _stats_embed_html() -> str:
         ("Rejected (guards)", counts["rejected"]),
         ("LLM timeouts", counts["timeouts"]),
         ("Socratic questions", counts["socratic"]),
+        ("Cooldown skips", counts["cooldown"]),
         ("Cache entries", len(_prompt_cache)),
         ("Uptime (hours)", f"{_STATS.uptime_hours():.1f}"),
     )
@@ -1608,6 +1714,51 @@ def _stats_embed_html() -> str:
         'opacity:0.7;text-transform:uppercase;letter-spacing:0.5px;">'
         "Prompt Enhancer — Stats</div>"
         f"{cells}</div>"
+    )
+
+
+def _help_embed_html(prefix: str, mode: str, style: str, is_admin: bool) -> str:
+    rows: list[tuple[str, str]] = []
+    if mode == "activate":
+        rows.append((f"{prefix}<prompt>", "Enhance this message (prefix stripped before sending)"))
+        rows.extend(
+            [
+                (f"{prefix}c: <prompt>", "Concise style for this message (or 'concise:')"),
+                (f"{prefix}s: <prompt>", "Standard style for this message (or 'standard:')"),
+                (f"{prefix}d: <prompt>", "Detailed style for this message (or 'detailed:')"),
+                (f"{prefix}show: <prompt>", "Also display the before/after comparison card"),
+                (f"{prefix}fresh: <prompt>", "Ignore any cached result and re-enhance"),
+                (f"{prefix}d,show: <prompt>", "Flags combine with commas"),
+            ]
+        )
+    else:
+        rows.append(("<prompt>", "Every message is enhanced automatically"))
+        rows.append((f"{prefix}<prompt>", "Send this message WITHOUT enhancement"))
+    rows.append((f"{prefix}help", "Show this help"))
+    if is_admin:
+        rows.append((f"{prefix}stats / {prefix}stats reset", "Runtime counters / reset (admin)"))
+
+    cells = "".join(
+        '<div style="padding:8px 16px;display:flex;justify-content:space-between;'
+        'gap:16px;border-bottom:1px solid rgba(128,128,128,0.12);">'
+        '<code style="font-size:12px;white-space:nowrap;">'
+        f"{_escape_html(cmd)}</code>"
+        f'<span style="opacity:0.7;text-align:right;">{_escape_html(desc)}</span></div>'
+        for cmd, desc in rows
+    )
+    footer = (
+        '<div style="padding:8px 16px;font-size:11px;opacity:0.6;">'
+        f"Mode: {_escape_html(mode)} · default style: {_escape_html(style)}</div>"
+    )
+    return (
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;'
+        "border:1px solid rgba(128,128,128,0.25);border-radius:12px;overflow:hidden;"
+        'margin:8px 0;font-size:13px;color:inherit;">'
+        '<div style="background:rgba(128,128,128,0.08);padding:8px 16px;'
+        "border-bottom:1px solid rgba(128,128,128,0.2);font-size:11px;font-weight:600;"
+        'opacity:0.7;text-transform:uppercase;letter-spacing:0.5px;">'
+        "Prompt Enhancer — Commands</div>"
+        f"{cells}{footer}</div>"
     )
 
 
@@ -1802,6 +1953,35 @@ class Filter:
                 "'activate': enhancement is opt-in — the prefix turns it ON for "
                 "that message. 'bypass': enhancement runs on every message and "
                 "the prefix turns it OFF (the pre-4.8 behavior)."
+            ),
+        )
+        enable_inline_commands: bool = Field(
+            default=True,
+            description=(
+                "Allow per-message flags after the prefix in activate mode "
+                "('!!d,show: prompt' → detailed style + comparison card; flags: "
+                "c/concise, s/standard, d/detailed, show, fresh) and the "
+                "'<prefix>help' command card. The admin stats command is always "
+                "available regardless of this setting."
+            ),
+        )
+        failure_threshold: int = Field(
+            default=3,
+            ge=0,
+            description=(
+                "Consecutive enhancement failures (LLM errors, timeouts, empty "
+                "output) before the enhancer pauses itself. 0 disables the "
+                "circuit breaker."
+            ),
+        )
+        failure_cooldown_seconds: float = Field(
+            default=120.0,
+            ge=0.0,
+            description=(
+                "How long the enhancer stays paused (forwarding original prompts "
+                "instantly) after tripping failure_threshold. Any successful "
+                "enhancement closes the breaker early; '<prefix>stats reset' "
+                "also clears it."
             ),
         )
 
@@ -2005,8 +2185,13 @@ class Filter:
         emitter: Optional[Callable[[Any], Awaitable[None]]],
         description: str,
         done: bool,
+        *,
+        force: bool = False,
     ) -> None:
-        if emitter is None or not self.valves.show_status:
+        # `force` surfaces the status even when show_status is off — used when
+        # the user explicitly triggered enhancement and it could not run, so
+        # the trigger never fails silently.
+        if emitter is None or not (force or self.valves.show_status):
             return
         try:
             await emitter(
@@ -2157,14 +2342,22 @@ class Filter:
             return bool(user_valves.get("enabled", True))
         return bool(getattr(user_valves, "enabled", True))
 
-    def _should_skip(self, user_message: str, *, followup: bool) -> Optional[str]:
-        """Return a human-readable skip reason, or None to proceed."""
+    def _should_skip(
+        self, user_message: str, *, followup: bool, explicit: bool = False
+    ) -> Optional[str]:
+        """Return a human-readable skip reason, or None to proceed.
+
+        An explicitly triggered message (activate-mode prefix) relaxes the
+        gates that exist only to avoid enhancing things nobody asked about:
+        the minimum length and the follow-up opt-out. Cost and quality guards
+        (max length, code-only, trivial, admin skip patterns) still apply.
+        """
         stripped = user_message.strip()
         if _is_trivial(stripped):
             return "trivial"
 
         length = len(stripped)
-        if length < self.valves.min_prompt_length:
+        if not explicit and length < self.valves.min_prompt_length:
             return "too short"
         max_length = self.valves.max_prompt_length
         if max_length > 0 and length > max_length:
@@ -2174,7 +2367,7 @@ class Filter:
             return "code-only"
         if _matches_custom_skip(user_message, self.valves.custom_skip_patterns):
             return "custom skip pattern"
-        if followup and self.valves.skip_followups:
+        if followup and self.valves.skip_followups and not explicit:
             return "follow-up"
         return None
 
@@ -2189,41 +2382,49 @@ class Filter:
         user_message: str,
         user_info: Optional[dict],
         emitter: Optional[Callable[[Any], Awaitable[None]]],
-    ) -> Optional[str]:
-        """Apply the per-message prefix and the admin stats command.
+    ) -> Optional[_PrefixOutcome]:
+        """Apply the per-message prefix, inline flags, and utility commands.
 
-        Returns the message text the pipeline should enhance, or None when
-        enhancement should not run for this message:
+        Returns a _PrefixOutcome describing how to enhance this message, or
+        None when enhancement should not run:
 
         - 'activate' mode: the prefix opts a message IN. Prefixed messages
-          have the prefix stripped (and forwarded stripped even if a later
-          skip-check or LLM failure prevents enhancement); everything else
-          passes through untouched, unenhanced.
+          have the prefix (and any inline flags) stripped — and are forwarded
+          stripped even if a later skip-check or LLM failure prevents
+          enhancement; everything else passes through untouched, unenhanced.
         - 'bypass' mode (legacy): every message is enhanced except prefixed
           ones, which are stripped and forwarded as-is.
 
-        The admin stats command works identically in both modes and raises to
-        abort the request so it never reaches the model.
+        The stats and help commands work in both modes and raise to abort the
+        request so they never reach the model.
         """
         prefix = self.valves.prefix.strip()
         activate = self.valves.prefix_mode == "activate"
         if not prefix:
             # No prefix configured: nothing can trigger opt-in enhancement;
             # legacy mode simply enhances everything.
-            return None if activate else user_message
+            return None if activate else _PrefixOutcome(text=user_message)
 
         leading = user_message.lstrip()
         if not leading.startswith(prefix):
-            return None if activate else user_message
+            return None if activate else _PrefixOutcome(text=user_message)
 
         remainder = leading[len(prefix) :].lstrip()
         command = " ".join(remainder.lower().split())
         is_admin = bool(user_info) and user_info.get("role") == "admin"
 
-        if is_admin and command in ("stats", "stats reset"):
+        if command in ("stats", "stats reset"):
+            if not is_admin:
+                # Abort with a notice instead of forwarding the literal word
+                # "stats" to the model.
+                raise RuntimeError(
+                    f"Prompt Enhancer: '{prefix}stats' is admin-only. "
+                    f"Send '{prefix}help' for available commands."
+                )
             if command == "stats reset":
                 _STATS.reset()
                 _prompt_cache.clear()
+                _breaker.reset()
                 label = "Prompt Enhancer stats reset"
             else:
                 label = "Prompt Enhancer stats"
@@ -2232,22 +2433,60 @@ class Filter:
             # the exception text doubles as a plain-text stats readout.
             raise RuntimeError(f"{label} — {_stats_summary()}")
 
+        if command == "help" and self.valves.enable_inline_commands:
+            user_valves = user_info.get("valves") if user_info else None
+            style, _ = self._resolve_user_overrides(user_valves)
+            await self._emit_html(
+                emitter,
+                _help_embed_html(prefix, self.valves.prefix_mode, style, is_admin),
+            )
+            # Plain-text fallback for clients that don't render the embed.
+            raise RuntimeError(
+                f"Prompt Enhancer commands: '{prefix}<prompt>' enhance | "
+                f"'{prefix}c:/s:/d: <prompt>' style | '{prefix}show: <prompt>' "
+                f"comparison card | '{prefix}fresh: <prompt>' skip cache | "
+                f"'{prefix}stats' counters (admin). Flags combine: "
+                f"'{prefix}d,show: <prompt>'."
+            )
+
         if not remainder:
             # Bare prefix with nothing behind it: leave the message untouched
             # rather than forwarding an empty message some providers reject.
             return None
 
-        # Strip the prefix from the outgoing message in both modes.
+        if not activate:
+            _set_last_user_message_text(messages, remainder)
+            body["messages"] = messages
+            _STATS.bump("bypassed")
+            logger.debug("Bypass prefix used — enhancement skipped")
+            return None
+
+        style_override: Optional[str] = None
+        force_embed = skip_cache = False
+        if self.valves.enable_inline_commands:
+            style_override, force_embed, skip_cache, remainder = _parse_inline_flags(
+                remainder
+            )
+            if not remainder:
+                # Flags with no prompt behind them ("!!d,show:") — nothing to
+                # enhance; leave the message untouched.
+                return None
+
         _set_last_user_message_text(messages, remainder)
         body["messages"] = messages
-
-        if activate:
-            logger.debug("Activation prefix used — enhancing this message")
-            return remainder
-
-        _STATS.bump("bypassed")
-        logger.debug("Bypass prefix used — enhancement skipped")
-        return None
+        logger.debug(
+            "Activation prefix used — enhancing (style=%s, show=%s, fresh=%s)",
+            style_override or "default",
+            force_embed,
+            skip_cache,
+        )
+        return _PrefixOutcome(
+            text=remainder,
+            explicit=True,
+            style_override=style_override,
+            force_embed=force_embed,
+            skip_cache=skip_cache,
+        )
 
     async def _apply_socratic(
         self,
@@ -2346,30 +2585,47 @@ class Filter:
         if not user_message.strip():
             return body
 
-        # --- Per-message prefix (activate/bypass) / admin stats command ---
-        resolved = await self._resolve_prefix(
+        # --- Per-message prefix (activate/bypass), flags, utility commands ---
+        prefixed = await self._resolve_prefix(
             body, messages, user_message, __user__, __event_emitter__
         )
-        if resolved is None:
+        if prefixed is None:
             return body
-        user_message = resolved
+        user_message = prefixed.text
+        explicit = prefixed.explicit
 
         followup = _is_followup(messages, user_message)
 
-        skip_reason = self._should_skip(user_message, followup=followup)
+        skip_reason = self._should_skip(
+            user_message, followup=followup, explicit=explicit
+        )
         if skip_reason:
             _STATS.bump("skipped")
             logger.debug("Skipped: %s", skip_reason)
+            await self._emit_status(
+                __event_emitter__,
+                f"Enhancement skipped ({skip_reason}) — sending original.",
+                True,
+                force=explicit,
+            )
             return body
 
         image_count, image_digest = _image_signature(messages)
         if image_count and self.valves.skip_with_images:
             _STATS.bump("skipped")
             logger.debug("Skipped: message has %d image attachment(s)", image_count)
+            await self._emit_status(
+                __event_emitter__,
+                "Enhancement skipped (image attachments) — sending original.",
+                True,
+                force=explicit,
+            )
             return body
 
         well_structured = _is_well_structured(user_message)
-        if well_structured and self.valves.skip_well_structured:
+        # An explicit trigger overrides the well-structured skip: the user
+        # asked, so give the light-refinement pass instead of doing nothing.
+        if well_structured and self.valves.skip_well_structured and not explicit:
             _STATS.bump("skipped")
             logger.debug("Skipped: prompt already well-structured")
             return body
@@ -2380,13 +2636,29 @@ class Filter:
         if not model_to_use:
             _STATS.bump("skipped")
             logger.debug("Skipped: no model could be resolved")
+            await self._emit_status(
+                __event_emitter__,
+                "Enhancement skipped (no model resolved) — sending original.",
+                True,
+                force=explicit,
+            )
             return body
         if _model_skipped(model_to_use, self.valves.skip_models):
             _STATS.bump("skipped")
             logger.debug("Skipped: model %s is on the skip-list", model_to_use)
+            await self._emit_status(
+                __event_emitter__,
+                "Enhancement skipped (model on skip-list) — sending original.",
+                True,
+                force=explicit,
+            )
             return body
 
         style, show_embed = self._resolve_user_overrides(user_valves)
+        if prefixed.style_override:
+            style = prefixed.style_override
+        if prefixed.force_embed:
+            show_embed = True
 
         # --- Intent detection (built-ins + admin custom intents) ---
         intents_catalog = dict(COMPILED_INTENTS)
@@ -2454,8 +2726,8 @@ class Filter:
             ttl_seconds=float(self.valves.cache_ttl_seconds),
         )
 
-        # --- Cache check ---
-        if self.valves.enable_cache:
+        # --- Cache check ('fresh' flag bypasses the read, not the write) ---
+        if self.valves.enable_cache and not prefixed.skip_cache:
             cached = _prompt_cache.get(signature, cache_prompt_key)
             if cached is not None:
                 _STATS.bump("cache_hits")
@@ -2498,6 +2770,7 @@ class Filter:
             followup=followup,
             well_structured=well_structured,
             active_intents=active_intents,
+            explicit=explicit,
             user_info=__user__,
             request=__request__,
             emitter=__event_emitter__,
@@ -2555,10 +2828,29 @@ class Filter:
         followup: bool,
         well_structured: bool,
         active_intents: Sequence[str],
+        explicit: bool,
         user_info: Optional[dict],
         request: Optional[Request],
         emitter: Optional[Callable[[Any], Awaitable[None]]],
     ) -> dict:
+        # Circuit breaker: after repeated LLM failures, forward originals
+        # instantly instead of making every message pay the full timeout.
+        cooldown_left = _breaker.remaining()
+        if cooldown_left > 0:
+            _STATS.bump("cooldown")
+            logger.debug(
+                "Enhancer paused (breaker open, %.0fs left) — using original",
+                cooldown_left,
+            )
+            await self._emit_status(
+                emitter,
+                "Enhancer paused after repeated failures "
+                f"(~{int(cooldown_left) + 1}s left) — using original prompt.",
+                True,
+                force=explicit,
+            )
+            return body
+
         system_prompt = _build_system_prompt(ctx, intents_catalog)
 
         logger.debug(
@@ -2604,15 +2896,28 @@ class Filter:
         outcome: dict[str, Any] = {"why": "no usable output", "rejected": False}
 
         async def _produce() -> Optional[str]:
+            # Breaker recording lives here (leader-only under coalescing) so N
+            # coalesced followers of one failed call can't trip it N times.
+            # Guard rejections (too long / over-expanded) never count: the LLM
+            # itself is healthy on those.
             raw = await self._call_llm_with_retry(request, payload, user)
             if raw is None:
                 outcome["why"] = "enhancer model failed or timed out"
+                _breaker.record_failure(
+                    self.valves.failure_threshold,
+                    float(self.valves.failure_cooldown_seconds),
+                )
                 return None
 
             cleaned = _clean_llm_output(raw)
             if not cleaned.strip():
                 outcome["why"] = "enhancer returned empty output (possible refusal)"
+                _breaker.record_failure(
+                    self.valves.failure_threshold,
+                    float(self.valves.failure_cooldown_seconds),
+                )
                 return None
+            _breaker.record_success()
 
             max_length = ctx.max_enhanced_length
             if max_length > 0 and len(cleaned) > max_length:
@@ -2657,6 +2962,7 @@ class Filter:
                     emitter,
                     f"Enhancement skipped ({outcome['why']}) — using original prompt.",
                     True,
+                    force=explicit,
                 )
                 return body
 
@@ -2702,7 +3008,10 @@ class Filter:
             _STATS.bump("failed")
             logger.exception("Enhancement failed: %s", exc)
             await self._emit_status(
-                emitter, "Enhancement error — using original prompt.", True
+                emitter,
+                "Enhancement error — using original prompt.",
+                True,
+                force=explicit,
             )
 
         return body
