@@ -25,6 +25,7 @@ from pydantic import ValidationError
 # ----------------------------------------------------------------------
 
 DRAFT_MARK = "--- BEGIN DRAFT ANSWER"
+MANAGER_MARK = None  # populated with the pipe module's marker after import
 
 
 def ok_response(text):
@@ -32,11 +33,17 @@ def ok_response(text):
     return {"choices": [{"message": {"content": text}}]}
 
 
+def default_plan():
+    """The default manager reply: plenty of numbered assignment lines."""
+    return "\n".join(f"{i}. default-angle-{i}" for i in range(1, 21))
+
+
 class Backend:
     """Records every internal completion call and serves configurable replies.
 
     Set ``impl`` to an ``async def impl(call) -> dict`` to control behavior;
-    by default candidates get "candidate-<n>" and synthesis gets "SYNTH-FINAL".
+    by default the manager gets a numbered assignment list, candidates get
+    "candidate-<n>", and synthesis gets "SYNTH-FINAL".
     """
 
     def __init__(self):
@@ -45,6 +52,7 @@ class Backend:
     def reset(self):
         self.calls = []
         self.total = 0
+        self.manager_calls = 0
         self.candidate_calls = 0
         self.synthesis_calls = 0
         self.active = 0
@@ -66,11 +74,24 @@ class Backend:
             for m in form_data.get("messages", [])
         )
 
+    @staticmethod
+    def is_manager(form_data):
+        return bool(MANAGER_MARK) and any(
+            isinstance(m, dict)
+            and isinstance(m.get("content"), str)
+            and MANAGER_MARK in m["content"]
+            for m in form_data.get("messages", [])
+        )
+
     async def __call__(self, request, form_data, user, bypass_filter=False):
         self.total += 1
         synthesis = self.is_synthesis(form_data)
+        manager = not synthesis and self.is_manager(form_data)
         if synthesis:
             self.synthesis_calls += 1
+            candidate_no = None
+        elif manager:
+            self.manager_calls += 1
             candidate_no = None
         else:
             self.candidate_calls += 1
@@ -79,6 +100,7 @@ class Backend:
             no=self.total,
             candidate_no=candidate_no,
             is_synthesis=synthesis,
+            is_manager=manager,
             form=copy.deepcopy(form_data),
             user=user,
             bypass_filter=bypass_filter,
@@ -91,9 +113,11 @@ class Backend:
         try:
             if self.impl is not None:
                 return await self.impl(call)
-            return ok_response(
-                "SYNTH-FINAL" if synthesis else f"candidate-{candidate_no}"
-            )
+            if synthesis:
+                return ok_response("SYNTH-FINAL")
+            if manager:
+                return ok_response(default_plan())
+            return ok_response(f"candidate-{candidate_no}")
         except asyncio.CancelledError:
             self.cancelled_count += 1
             raise
@@ -159,6 +183,7 @@ consensus_10_pipe = importlib.util.module_from_spec(_spec)
 sys.modules["consensus_10_pipe"] = consensus_10_pipe
 _spec.loader.exec_module(consensus_10_pipe)
 Pipe = consensus_10_pipe.Pipe
+MANAGER_MARK = consensus_10_pipe._MANAGER_MARK
 
 # ----------------------------------------------------------------------
 # Test helpers
@@ -262,14 +287,16 @@ def _fresh_backend():
 # ----------------------------------------------------------------------
 
 
-def test_default_flow_10_candidates_plus_synthesis():
+def test_default_flow_manager_10_candidates_synthesis():
     async def scenario():
         pipe = make_pipe()
         result = await call_pipe(pipe)
         assert result == "SYNTH-FINAL"
-        assert BACKEND.total == 11
+        assert BACKEND.total == 12
+        assert BACKEND.manager_calls == 1
         assert BACKEND.candidate_calls == 10
         assert BACKEND.synthesis_calls == 1
+        assert BACKEND.calls[0].is_manager  # the manager plans first
         assert BACKEND.calls[-1].is_synthesis  # synthesis is the final call
 
     run(scenario())
@@ -279,7 +306,7 @@ def test_all_calls_use_target_model():
     async def scenario():
         pipe = make_pipe()
         await call_pipe(pipe)
-        assert len(BACKEND.calls) == 11
+        assert len(BACKEND.calls) == 12  # manager included
         for call in BACKEND.calls:
             assert call.form["model"] == "base-model"
             assert call.form["stream"] is False
@@ -308,7 +335,9 @@ def test_candidates_run_concurrently():
             return ok_response(f"candidate-{call.candidate_no}")
 
         BACKEND.impl = impl
-        pipe = make_pipe(CANDIDATE_COUNT=6, MIN_SUCCESSFUL_RESPONSES=6)
+        pipe = make_pipe(
+            CANDIDATE_COUNT=6, MIN_SUCCESSFUL_RESPONSES=6, ENABLE_MANAGER=False
+        )
         result = await call_pipe(pipe)
         assert result == "SYNTH-FINAL"
         assert BACKEND.max_active == 6
@@ -325,7 +354,7 @@ def test_max_concurrency_respected():
             return ok_response(f"candidate-{call.candidate_no}")
 
         BACKEND.impl = impl
-        pipe = make_pipe(CANDIDATE_COUNT=9, MAX_CONCURRENCY=3)
+        pipe = make_pipe(CANDIDATE_COUNT=9, MAX_CONCURRENCY=3, ENABLE_MANAGER=False)
         await call_pipe(pipe)
         assert BACKEND.candidate_calls == 9
         assert BACKEND.max_active <= 3  # the hard cap
@@ -366,7 +395,9 @@ def test_direct_recursion_rejected():
 
 def test_reentrancy_blocked_for_internal_calls():
     async def scenario():
-        pipe = make_pipe(CANDIDATE_COUNT=3, MIN_SUCCESSFUL_RESPONSES=1)
+        pipe = make_pipe(
+            CANDIDATE_COUNT=3, MIN_SUCCESSFUL_RESPONSES=1, ENABLE_MANAGER=False
+        )
         nested = {}
 
         async def impl(call):
@@ -402,6 +433,7 @@ def test_sanitization_strips_side_effect_fields():
             MIN_SUCCESSFUL_RESPONSES=2,
             CANDIDATE_MAX_TOKENS=222,
             SYNTHESIS_MAX_TOKENS=333,
+            ENABLE_MANAGER=False,  # assignment injection has its own test
         )
         await call_pipe(pipe)
 
@@ -447,7 +479,7 @@ def test_internal_calls_get_isolated_request_state():
         # the pipe must hand internal calls a clone with clean state.
         request = make_request()
         await call_pipe(make_pipe(CANDIDATE_COUNT=2), request=request)
-        assert BACKEND.total == 3
+        assert BACKEND.total == 4  # manager + 2 candidates + synthesis
         for call in BACKEND.calls:
             assert isinstance(call.request, FakeRequest)
             assert call.request is not request
@@ -477,7 +509,7 @@ def test_partial_failures_tolerated_above_threshold():
         async def emitter(event):
             events.append(event)
 
-        pipe = make_pipe(MAX_RETRIES=0)  # defaults: 10 candidates, min 6
+        pipe = make_pipe(MAX_RETRIES=0, ENABLE_MANAGER=False)  # 10 candidates, min 6
         result = await call_pipe(pipe, emitter=emitter)
         assert result == "SYNTH-FINAL"
         assert BACKEND.candidate_calls == 10
@@ -502,7 +534,7 @@ def test_too_many_failures_produce_sanitized_error():
             return ok_response(f"candidate-{call.candidate_no}")
 
         BACKEND.impl = impl
-        pipe = make_pipe(MAX_RETRIES=0)  # 4 successes < min 6
+        pipe = make_pipe(MAX_RETRIES=0, ENABLE_MANAGER=False)  # 4 successes < min 6
         with pytest.raises(Exception) as excinfo:
             await call_pipe(pipe)
         message = str(excinfo.value)
@@ -528,7 +560,10 @@ def test_per_call_timeout_enforced():
 
         BACKEND.impl = impl
         pipe = make_pipe(
-            CANDIDATE_COUNT=3, REQUEST_TIMEOUT_SECONDS=0.05, MAX_RETRIES=1
+            CANDIDATE_COUNT=3,
+            REQUEST_TIMEOUT_SECONDS=0.05,
+            MAX_RETRIES=1,
+            ENABLE_MANAGER=False,
         )
         started = time.monotonic()
         with pytest.raises(Exception, match="timed out"):
@@ -568,6 +603,7 @@ def test_transient_failures_are_retried():
             MAX_CONCURRENCY=4,
             MIN_SUCCESSFUL_RESPONSES=4,
             MAX_RETRIES=1,
+            ENABLE_MANAGER=False,
         )
         result = await call_pipe(pipe, emitter=emitter)
         assert result == "SYNTH-FINAL"
@@ -591,7 +627,7 @@ def test_permanent_errors_are_not_retried():
             raise error
 
         BACKEND.impl = impl
-        pipe = make_pipe(CANDIDATE_COUNT=3, MAX_RETRIES=2)
+        pipe = make_pipe(CANDIDATE_COUNT=3, MAX_RETRIES=2, ENABLE_MANAGER=False)
         with pytest.raises(Exception) as excinfo:
             await call_pipe(pipe)
         assert BACKEND.candidate_calls == 3  # one attempt each, no retries
@@ -618,7 +654,12 @@ def test_only_successful_answers_reach_synthesis():
             return ok_response(f"candidate-{call.candidate_no}")
 
         BACKEND.impl = impl
-        pipe = make_pipe(CANDIDATE_COUNT=6, MIN_SUCCESSFUL_RESPONSES=1, MAX_RETRIES=0)
+        pipe = make_pipe(
+            CANDIDATE_COUNT=6,
+            MIN_SUCCESSFUL_RESPONSES=1,
+            MAX_RETRIES=0,
+            ENABLE_MANAGER=False,
+        )
         await call_pipe(pipe)
         drafts = BACKEND.calls[-1].form["messages"][-1]["content"]
         assert drafts.count(DRAFT_MARK) == 3
@@ -659,7 +700,10 @@ def test_cancellation_cleans_up_child_tasks():
         # An emitter is passed so the heartbeat ticker task exists too: the
         # leftover-task assertion below then also proves the ticker is reaped.
         pipe = make_pipe(
-            CANDIDATE_COUNT=6, MAX_CONCURRENCY=6, PROGRESS_INTERVAL_SECONDS=0.5
+            CANDIDATE_COUNT=6,
+            MAX_CONCURRENCY=6,
+            PROGRESS_INTERVAL_SECONDS=0.5,
+            ENABLE_MANAGER=False,
         )
 
         async def emitter(event):
@@ -702,6 +746,7 @@ def test_progress_events_report_counts_but_no_content():
         await call_pipe(make_pipe(), emitter=emitter)
         assert all(e["type"] == "status" for e in events)
         descriptions = [e["data"]["description"] for e in events]
+        assert descriptions[0].startswith("Planning 10 distinct assignments")
         assert any(
             d.startswith("Generating candidate answers: 0/10") for d in descriptions
         )
@@ -714,6 +759,7 @@ def test_progress_events_report_counts_but_no_content():
         for description in descriptions:
             assert "candidate-" not in description
             assert "SYNTH-FINAL" not in description
+            assert "default-angle" not in description  # assignments stay private
 
     run(scenario())
 
@@ -737,7 +783,10 @@ def test_heartbeat_ticks_while_waiting_on_the_model():
 
         BACKEND.impl = impl
         pipe = make_pipe(
-            CANDIDATE_COUNT=3, MIN_SUCCESSFUL_RESPONSES=3, PROGRESS_INTERVAL_SECONDS=0.5
+            CANDIDATE_COUNT=3,
+            MIN_SUCCESSFUL_RESPONSES=3,
+            PROGRESS_INTERVAL_SECONDS=0.5,
+            ENABLE_MANAGER=False,
         )
         runner = asyncio.create_task(call_pipe(pipe, emitter=emitter))
 
@@ -792,6 +841,152 @@ def test_progress_events_can_be_disabled():
 
 
 # ----------------------------------------------------------------------
+# Manager delegation
+# ----------------------------------------------------------------------
+
+
+def test_manager_plans_first_and_assigns_distinct_angles():
+    async def scenario():
+        async def impl(call):
+            if call.is_manager:
+                return ok_response("1. alpha\n2. beta\n3. gamma\n4. delta")
+            if call.is_synthesis:
+                return ok_response("SYNTH-FINAL")
+            return ok_response(f"candidate-{call.candidate_no}")
+
+        BACKEND.impl = impl
+        pipe = make_pipe(
+            CANDIDATE_COUNT=4, MIN_SUCCESSFUL_RESPONSES=4, MANAGER_TEMPERATURE=0.9
+        )
+        result = await call_pipe(pipe)
+        assert result == "SYNTH-FINAL"
+        assert BACKEND.total == 6
+        assert BACKEND.calls[0].is_manager
+
+        manager_form = BACKEND.calls[0].form
+        assert manager_form["model"] == "base-model"
+        assert manager_form["temperature"] == 0.9
+        assert manager_form["messages"][0]["role"] == "system"
+        assert MANAGER_MARK in manager_form["messages"][0]["content"]
+        # the conversation sits between the manager prompt and its task line
+        assert manager_form["messages"][1:3] == [
+            {"role": "system", "content": "You are terse."},
+            {"role": "user", "content": "What is 2+2?"},
+        ]
+        assert manager_form["messages"][-1]["role"] == "user"
+        assert "numbered list" in manager_form["messages"][-1]["content"]
+
+        directives = []
+        for call in BACKEND.calls[1:5]:
+            assert not call.is_manager and not call.is_synthesis
+            last = call.form["messages"][-1]
+            assert last["role"] == "system"
+            assert "assigned angle" in last["content"]
+            directives.append(last["content"].split('"')[1])
+        # every candidate got its own distinct assignment
+        assert sorted(directives) == ["alpha", "beta", "delta", "gamma"]
+
+        drafts = BACKEND.calls[-1].form["messages"][-1]["content"]
+        for directive in ("alpha", "beta", "gamma", "delta"):
+            assert f'assigned angle: "{directive}"' in drafts
+
+    run(scenario())
+
+
+def test_manager_failure_falls_back_to_identical_sampling():
+    async def scenario():
+        events = []
+
+        async def emitter(event):
+            events.append(event)
+
+        async def impl(call):
+            if call.is_manager:
+                raise RuntimeError("manager exploded sk-SECRET")
+            if call.is_synthesis:
+                return ok_response("SYNTH-FINAL")
+            return ok_response(f"candidate-{call.candidate_no}")
+
+        BACKEND.impl = impl
+        pipe = make_pipe(CANDIDATE_COUNT=4, MIN_SUCCESSFUL_RESPONSES=4, MAX_RETRIES=0)
+        result = await call_pipe(pipe, emitter=emitter)
+        assert result == "SYNTH-FINAL"
+        assert BACKEND.manager_calls == 1
+        assert BACKEND.candidate_calls == 4
+        for call in BACKEND.calls:
+            if not call.is_manager and not call.is_synthesis:
+                assert not any(
+                    "assigned angle" in str(m.get("content"))
+                    for m in call.form["messages"]
+                )
+        descriptions = [e["data"]["description"] for e in events]
+        assert any("sample the same prompt" in d for d in descriptions)
+        assert not any("sk-SECRET" in d for d in descriptions)
+
+    run(scenario())
+
+
+def test_manager_unparseable_plan_falls_back():
+    async def scenario():
+        async def impl(call):
+            if call.is_manager:
+                return ok_response("Just answer as well as you can, no list needed.")
+            if call.is_synthesis:
+                return ok_response("SYNTH-FINAL")
+            return ok_response(f"candidate-{call.candidate_no}")
+
+        BACKEND.impl = impl
+        pipe = make_pipe(CANDIDATE_COUNT=4, MIN_SUCCESSFUL_RESPONSES=4)
+        result = await call_pipe(pipe)
+        assert result == "SYNTH-FINAL"
+        assert BACKEND.total == 6  # manager attempt + 4 candidates + synthesis
+        for call in BACKEND.calls[1:5]:
+            assert not any(
+                "assigned angle" in str(m.get("content"))
+                for m in call.form["messages"]
+            )
+
+    run(scenario())
+
+
+def test_short_plan_is_cycled_across_candidates():
+    async def scenario():
+        async def impl(call):
+            if call.is_manager:
+                return ok_response("1. alpha\n2. beta")
+            if call.is_synthesis:
+                return ok_response("SYNTH-FINAL")
+            return ok_response(f"candidate-{call.candidate_no}")
+
+        BACKEND.impl = impl
+        pipe = make_pipe(CANDIDATE_COUNT=4, MIN_SUCCESSFUL_RESPONSES=4)
+        await call_pipe(pipe)
+        directives = [
+            call.form["messages"][-1]["content"].split('"')[1]
+            for call in BACKEND.calls[1:5]
+        ]
+        assert sorted(directives) == ["alpha", "alpha", "beta", "beta"]
+
+    run(scenario())
+
+
+def test_manager_can_be_disabled():
+    async def scenario():
+        pipe = make_pipe(CANDIDATE_COUNT=2, ENABLE_MANAGER=False)
+        result = await call_pipe(pipe)
+        assert result == "SYNTH-FINAL"
+        assert BACKEND.total == 3  # candidates + synthesis only
+        assert BACKEND.manager_calls == 0
+        for call in BACKEND.calls:
+            assert not any(
+                "assigned angle" in str(m.get("content"))
+                for m in call.form["messages"]
+            )
+
+    run(scenario())
+
+
+# ----------------------------------------------------------------------
 # Configuration behavior
 # ----------------------------------------------------------------------
 
@@ -802,6 +997,7 @@ def test_internal_task_uses_a_single_call():
         result = await call_pipe(make_pipe(), task="title_generation")
         assert result == "candidate-1"
         assert BACKEND.total == 1
+        assert BACKEND.manager_calls == 0  # no planning for housekeeping tasks
         assert BACKEND.calls[0].form["model"] == "base-model"
         assert BACKEND.calls[0].form["stream"] is False
 
@@ -825,6 +1021,7 @@ def test_valve_bounds_are_enforced():
         {"MAX_RETRIES": -1},
         {"CANDIDATE_TEMPERATURE": 3.0},
         {"PROGRESS_INTERVAL_SECONDS": 0.1},
+        {"MANAGER_TEMPERATURE": 3.0},
     ):
         with pytest.raises(ValidationError):
             Pipe.Valves(TARGET_MODEL_ID="base-model", **overrides)

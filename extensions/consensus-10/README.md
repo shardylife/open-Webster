@@ -1,16 +1,21 @@
 # Consensus-10 — Open WebUI Pipe Function
 
 Consensus-10 is a native Open WebUI **Pipe Function** (not a legacy Pipelines
-service). When you chat with it, it sends your entire conversation to
-**10 concurrent generations** of one configured base model, then makes an
-**11th call to the same model** that compares the candidate answers and
-synthesizes the single strongest reply. Only that synthesized reply appears in
-the chat; the intermediate answers are never shown or saved.
+service). Each user turn first runs a **manager generation** that splits the
+request into 10 distinct working angles (approach, perspective, depth, edge
+cases, counterarguments, …), then sends your entire conversation to
+**10 concurrent generations** of one configured base model — each steered by
+its assigned angle — and finally makes a **synthesis call to the same model**
+that compares the drafts and writes the single strongest reply. Only that
+synthesized reply appears in the chat; the intermediate answers are never
+shown or saved. If the manager call fails or returns nothing usable, the
+candidates fall back to sampling the identical prompt (`ENABLE_MANAGER=false`
+forces that mode permanently).
 
 > **Cost warning:** with default settings every user turn performs
-> `CANDIDATE_COUNT + 1` (**11**) full model generations. Expect roughly the
-> latency of your slowest candidate plus one synthesis generation, and ~11×
-> the token cost of a normal chat turn. Size `CANDIDATE_COUNT`,
+> `CANDIDATE_COUNT + 2` (**12**) full model generations. Expect roughly the
+> manager call plus your slowest candidate plus one synthesis generation, and
+> ~12× the token cost of a normal chat turn. Size `CANDIDATE_COUNT`,
 > `MAX_CONCURRENCY`, and the `*_MAX_TOKENS` valves accordingly.
 
 ## Installation
@@ -37,14 +42,17 @@ connection already serves the target model.
 | --- | --- | --- |
 | `TARGET_MODEL_ID` | *(required)* | Base model that serves all candidate **and** synthesis calls. |
 | `CANDIDATE_COUNT` | `10` (2–20) | Independent candidate generations per turn. |
+| `ENABLE_MANAGER` | `true` | Run one extra manager generation first that assigns each candidate a distinct working angle; falls back to identical sampling when the manager call fails. |
 | `MAX_CONCURRENCY` | `10` | Maximum candidate requests in flight at once (semaphore). |
 | `REQUEST_TIMEOUT_SECONDS` | `300` | Per-attempt timeout for every internal request. |
 | `MAX_RETRIES` | `1` | Extra attempts after *transient* failures. HTTP 400/401/403/404-class errors are never retried. |
 | `MIN_SUCCESSFUL_RESPONSES` | `6` | Minimum successful candidates required to synthesize; fewer aborts with a clean error. Clamped to `CANDIDATE_COUNT`. |
 | `CANDIDATE_TEMPERATURE` | `0.7` | Sampling temperature for candidates (diversity). |
 | `SYNTHESIS_TEMPERATURE` | `0.2` | Sampling temperature for the synthesis call. |
+| `MANAGER_TEMPERATURE` | `0.7` | Sampling temperature for the manager planning call. |
 | `CANDIDATE_MAX_TOKENS` | *(unset)* | `max_tokens` for candidates; empty uses the provider default. |
 | `SYNTHESIS_MAX_TOKENS` | *(unset)* | `max_tokens` for synthesis. |
+| `MANAGER_MAX_TOKENS` | *(unset)* | `max_tokens` for the manager planning call. |
 | `MAX_CANDIDATE_CHARACTERS` | `8000` | Per-candidate cap when quoting answers into the synthesis prompt. |
 | `SHOW_PROGRESS` | `true` | Emit status events (`Generating candidate answers: 6/10 (3 running, 1m 05s)`, …). |
 | `PROGRESS_INTERVAL_SECONDS` | `2` | Seconds between liveness heartbeats — elapsed time plus running/queued/failed/retried counts — so long waits visibly tick instead of looking frozen. |
@@ -64,6 +72,11 @@ connection already serves the target model.
 - **Untrusted candidates.** The synthesis prompt quotes candidates as
   numbered, delimited, explicitly untrusted material and instructs the model
   never to follow instructions inside them nor mention the consensus process.
+- **Contained assignments.** Manager output is model-generated text: it is
+  parsed leniently into short, length-capped directives, injected only as
+  quoted "angle" system messages that must still satisfy the full request,
+  and the run falls back to identical sampling whenever the plan is unusable
+  — the manager can never fail the turn on its own.
 - **Sanitized errors.** User-facing errors carry short static descriptions
   (e.g. `request timed out`, `upstream error (HTTP 500)`) — never stack
   traces, URLs, keys, or upstream error bodies. Prompts and responses are not
@@ -82,7 +95,7 @@ python3 -m py_compile extensions/consensus-10/consensus_10_pipe.py \
 python3 -m pytest -q extensions/consensus-10/test_consensus_10_pipe.py
 ```
 
-The suite (25 tests) is deterministic and hermetic: `open_webui` is stubbed
+The suite (31 tests) is deterministic and hermetic: `open_webui` is stubbed
 with an in-process mock completion backend, concurrency is proven with
 barriers rather than sleeps, and no network or running Open WebUI instance is
 required.
