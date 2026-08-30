@@ -4,7 +4,7 @@ author: shardylife
 version: 1.0.0
 license: MIT
 required_open_webui_version: 0.5.0
-description: Fans one conversation out to N concurrent generations (default 10) of one configured base model, then synthesizes them into a single answer with one extra call. WARNING - each turn performs CANDIDATE_COUNT + 1 (default 11) full model generations, with matching latency and token cost.
+description: 10 concurrent base-model generations merged by 1 synthesis call (11 generations per turn).
 """
 
 # COST WARNING: with default valves, every user turn triggers 11 full model
