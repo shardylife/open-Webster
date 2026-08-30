@@ -472,13 +472,24 @@ def test_partial_failures_tolerated_above_threshold():
             return ok_response(f"candidate-{call.candidate_no}")
 
         BACKEND.impl = impl
+        events = []
+
+        async def emitter(event):
+            events.append(event)
+
         pipe = make_pipe(MAX_RETRIES=0)  # defaults: 10 candidates, min 6
-        result = await call_pipe(pipe)
+        result = await call_pipe(pipe, emitter=emitter)
         assert result == "SYNTH-FINAL"
         assert BACKEND.candidate_calls == 10
         assert BACKEND.synthesis_calls == 1
         drafts = BACKEND.calls[-1].form["messages"][-1]["content"]
         assert drafts.count(DRAFT_MARK) == 7
+        final_line = next(
+            e["data"]["description"]
+            for e in events
+            if e["data"]["description"].startswith("Generating candidate answers: 10/10")
+        )
+        assert "3 failed" in final_line  # failures are visible in the status
 
     run(scenario())
 
@@ -547,16 +558,27 @@ def test_transient_failures_are_retried():
             return ok_response(f"candidate-{call.candidate_no}")
 
         BACKEND.impl = impl
+        events = []
+
+        async def emitter(event):
+            events.append(event)
+
         pipe = make_pipe(
             CANDIDATE_COUNT=4,
             MAX_CONCURRENCY=4,
             MIN_SUCCESSFUL_RESPONSES=4,
             MAX_RETRIES=1,
         )
-        result = await call_pipe(pipe)
+        result = await call_pipe(pipe, emitter=emitter)
         assert result == "SYNTH-FINAL"
         assert BACKEND.candidate_calls == 8  # 4 failures + 4 successful retries
         assert BACKEND.total == 9
+        final_line = next(
+            e["data"]["description"]
+            for e in events
+            if e["data"]["description"].startswith("Generating candidate answers: 4/4")
+        )
+        assert "4 retried" in final_line  # retries are visible in the status
 
     run(scenario())
 
@@ -634,8 +656,16 @@ def test_cancellation_cleans_up_child_tasks():
             return ok_response("never")
 
         BACKEND.impl = impl
-        pipe = make_pipe(CANDIDATE_COUNT=6, MAX_CONCURRENCY=6)
-        runner = asyncio.create_task(call_pipe(pipe))
+        # An emitter is passed so the heartbeat ticker task exists too: the
+        # leftover-task assertion below then also proves the ticker is reaped.
+        pipe = make_pipe(
+            CANDIDATE_COUNT=6, MAX_CONCURRENCY=6, PROGRESS_INTERVAL_SECONDS=0.5
+        )
+
+        async def emitter(event):
+            pass
+
+        runner = asyncio.create_task(call_pipe(pipe, emitter=emitter))
 
         deadline = time.monotonic() + 5
         while BACKEND.started < 6:
@@ -672,13 +702,78 @@ def test_progress_events_report_counts_but_no_content():
         await call_pipe(make_pipe(), emitter=emitter)
         assert all(e["type"] == "status" for e in events)
         descriptions = [e["data"]["description"] for e in events]
-        assert "Generating candidate answers: 0/10" in descriptions
-        assert "Generating candidate answers: 10/10" in descriptions
+        assert any(
+            d.startswith("Generating candidate answers: 0/10") for d in descriptions
+        )
+        assert any(
+            d.startswith("Generating candidate answers: 10/10") for d in descriptions
+        )
         assert "Synthesizing 10 successful answers" in descriptions
         assert events[-1]["data"]["done"] is True
+        assert events[-1]["data"]["description"].startswith("Consensus complete")
         for description in descriptions:
             assert "candidate-" not in description
             assert "SYNTH-FINAL" not in description
+
+    run(scenario())
+
+
+def test_heartbeat_ticks_while_waiting_on_the_model():
+    async def scenario():
+        events = []
+
+        async def emitter(event):
+            events.append(event)
+
+        candidate_gate = asyncio.Event()
+        synthesis_gate = asyncio.Event()
+
+        async def impl(call):
+            if call.is_synthesis:
+                await synthesis_gate.wait()
+                return ok_response("SYNTH-FINAL")
+            await candidate_gate.wait()
+            return ok_response(f"candidate-{call.candidate_no}")
+
+        BACKEND.impl = impl
+        pipe = make_pipe(
+            CANDIDATE_COUNT=3, MIN_SUCCESSFUL_RESPONSES=3, PROGRESS_INTERVAL_SECONDS=0.5
+        )
+        runner = asyncio.create_task(call_pipe(pipe, emitter=emitter))
+
+        def candidate_ticks():
+            return [
+                d
+                for d in (e["data"]["description"] for e in events)
+                if d.startswith("Generating candidate answers: 0/3 (")
+                and "3 running" in d
+            ]
+
+        # With zero candidates finished, heartbeats alone must keep the status
+        # moving: liveness ticks carrying running counts and elapsed time.
+        deadline = time.monotonic() + 10
+        while len(candidate_ticks()) < 2:
+            assert time.monotonic() < deadline, "no heartbeats while candidates ran"
+            await asyncio.sleep(0.02)
+        assert all(d.rstrip(")").endswith("s") for d in candidate_ticks())
+
+        candidate_gate.set()
+
+        def synthesis_ticks():
+            return [
+                d
+                for d in (e["data"]["description"] for e in events)
+                if d.startswith("Synthesizing 3 successful answers (")
+            ]
+
+        deadline = time.monotonic() + 10
+        while not synthesis_ticks():
+            assert time.monotonic() < deadline, "no heartbeat during synthesis"
+            await asyncio.sleep(0.02)
+
+        synthesis_gate.set()
+        assert await runner == "SYNTH-FINAL"
+        assert events[-1]["data"]["done"] is True
 
     run(scenario())
 
@@ -729,6 +824,7 @@ def test_valve_bounds_are_enforced():
         {"REQUEST_TIMEOUT_SECONDS": 0},
         {"MAX_RETRIES": -1},
         {"CANDIDATE_TEMPERATURE": 3.0},
+        {"PROGRESS_INTERVAL_SECONDS": 0.1},
     ):
         with pytest.raises(ValidationError):
             Pipe.Valves(TARGET_MODEL_ID="base-model", **overrides)

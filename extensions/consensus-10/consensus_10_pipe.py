@@ -1,7 +1,7 @@
 """
 title: Consensus-10
 author: shardylife
-version: 1.0.0
+version: 1.1.0
 license: MIT
 required_open_webui_version: 0.5.0
 description: 10 concurrent base-model generations merged by 1 synthesis call (11 generations per turn).
@@ -15,8 +15,10 @@ import asyncio
 import copy
 import inspect
 import logging
+import time
 from collections import Counter
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
 from fastapi import Request
@@ -103,6 +105,22 @@ _SYNTHESIS_TASK_TEMPLATE = (
     "{blocks}\n\n"
     "Following your rules, write the single final answer to my request now."
 )
+
+
+@dataclass
+class _RunStats:
+    """Mutable counters shared by the workers and the heartbeat ticker."""
+
+    total: int
+    done: int = 0
+    ok: int = 0
+    failed: int = 0
+    running: int = 0
+    retries: int = 0
+    started_at: float = field(default_factory=time.monotonic)
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started_at
 
 
 class _ResponseFormatError(ValueError):
@@ -210,7 +228,18 @@ class Pipe:
         )
         SHOW_PROGRESS: bool = Field(
             default=True,
-            description="Emit status events while candidates are generating.",
+            description="Emit status events, including liveness heartbeats, during generation.",
+        )
+        PROGRESS_INTERVAL_SECONDS: float = Field(
+            default=2.0,
+            ge=0.5,
+            le=60,
+            description=(
+                "Seconds between liveness heartbeats (elapsed time plus "
+                "running/queued/failed/retried counts) while waiting on the "
+                "model. Each update is also appended to the message's status "
+                "history, so raise this if that growth matters."
+            ),
         )
 
     def __init__(self) -> None:
@@ -251,6 +280,7 @@ class Pipe:
 
         user = await self._resolve_user(__user__)
         emitter = __event_emitter__ if valves.SHOW_PROGRESS else None
+        run_started = time.monotonic()
 
         token = _CONSENSUS_ACTIVE.set(True)
         try:
@@ -288,10 +318,29 @@ class Pipe:
                 emitter, f"Synthesizing {len(answers)} successful answers", done=False
             )
             synthesis_form = self._synthesis_form_data(body, target, answers)
-            try:
-                final_answer = await self._call_with_retries(
-                    __request__, synthesis_form, user
+            synthesis_stats = _RunStats(total=1)
+
+            def count_synthesis_retry() -> None:
+                synthesis_stats.retries += 1
+
+            def synthesis_status() -> str:
+                parts = []
+                if synthesis_stats.retries:
+                    parts.append(f"{synthesis_stats.retries} retried")
+                parts.append(self._format_elapsed(synthesis_stats.elapsed()))
+                return (
+                    f"Synthesizing {len(answers)} successful answers "
+                    f"({', '.join(parts)})"
                 )
+
+            ticker = self._start_heartbeat(emitter, synthesis_status)
+            try:
+                try:
+                    final_answer = await self._call_with_retries(
+                        __request__, synthesis_form, user, on_retry=count_synthesis_retry
+                    )
+                finally:
+                    await self._cancel_tasks([ticker])
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -303,7 +352,8 @@ class Pipe:
 
             await self._emit_status(
                 emitter,
-                f"Consensus complete: synthesized {len(answers)} candidate answers",
+                f"Consensus complete: synthesized {len(answers)} candidate answers "
+                f"in {self._format_elapsed(time.monotonic() - run_started)}",
                 done=True,
             )
             return final_answer
@@ -331,18 +381,28 @@ class Pipe:
         valves = self.valves
         count = valves.CANDIDATE_COUNT
         semaphore = asyncio.Semaphore(max(1, min(valves.MAX_CONCURRENCY, count)))
+        stats = _RunStats(total=count)
+
+        def count_retry() -> None:
+            stats.retries += 1
 
         async def run_one(index: int) -> "tuple[int, Optional[str], Optional[str]]":
             try:
                 async with semaphore:
-                    form_data = self._internal_form_data(
-                        body,
-                        target,
-                        valves.CANDIDATE_TEMPERATURE,
-                        valves.CANDIDATE_MAX_TOKENS,
-                    )
-                    text = await self._call_with_retries(request, form_data, user)
-                    return (index, text, None)
+                    stats.running += 1
+                    try:
+                        form_data = self._internal_form_data(
+                            body,
+                            target,
+                            valves.CANDIDATE_TEMPERATURE,
+                            valves.CANDIDATE_MAX_TOKENS,
+                        )
+                        text = await self._call_with_retries(
+                            request, form_data, user, on_retry=count_retry
+                        )
+                        return (index, text, None)
+                    finally:
+                        stats.running -= 1
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -350,26 +410,27 @@ class Pipe:
                 log.warning("Consensus-10 candidate %d failed: %s", index + 1, reason)
                 return (index, None, reason)
 
-        await self._emit_status(
-            emitter, f"Generating candidate answers: 0/{count}", done=False
-        )
+        await self._emit_status(emitter, self._candidate_status(stats), done=False)
+        ticker = self._start_heartbeat(emitter, lambda: self._candidate_status(stats))
         tasks = [asyncio.create_task(run_one(i)) for i in range(count)]
         results: "list[tuple[int, Optional[str], Optional[str]]]" = []
         try:
             for finished in asyncio.as_completed(tasks):
-                results.append(await finished)
+                record = await finished
+                results.append(record)
+                stats.done += 1
+                if record[1] is not None:
+                    stats.ok += 1
+                else:
+                    stats.failed += 1
                 await self._emit_status(
-                    emitter,
-                    f"Generating candidate answers: {len(results)}/{count}",
-                    done=False,
+                    emitter, self._candidate_status(stats), done=False
                 )
         finally:
             # Reached on outer cancellation or unexpected errors as well as on
-            # success: make sure no candidate task outlives this call.
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # success: neither the candidate tasks nor the heartbeat ticker may
+            # outlive this call.
+            await self._cancel_tasks([*tasks, ticker])
 
         results.sort(key=lambda item: item[0])
         answers = [text for _, text, _ in results if text]
@@ -380,7 +441,13 @@ class Pipe:
     # Internal requests
     # ------------------------------------------------------------------
 
-    async def _call_with_retries(self, request: Any, form_data: dict, user: Any) -> str:
+    async def _call_with_retries(
+        self,
+        request: Any,
+        form_data: dict,
+        user: Any,
+        on_retry: Optional[Callable[[], None]] = None,
+    ) -> str:
         """One internal completion with timeout, retry, and error hygiene."""
         valves = self.valves
         attempts = 1 + valves.MAX_RETRIES
@@ -399,6 +466,8 @@ class Pipe:
                 last_error = exc
                 if self._is_permanent(exc) or attempt >= attempts:
                     raise
+                if on_retry is not None:
+                    on_retry()
                 if self.RETRY_BACKOFF_SECONDS > 0:
                     await asyncio.sleep(self.RETRY_BACKOFF_SECONDS * attempt)
         raise last_error if last_error else Exception("Consensus-10: request failed")
@@ -524,6 +593,64 @@ class Pipe:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        seconds = int(seconds)
+        if seconds < 60:
+            return f"{seconds}s"
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+
+    def _candidate_status(self, stats: _RunStats) -> str:
+        """One-line liveness summary, e.g. '3/10 (6 running, 1 failed, 42s)'."""
+        parts = []
+        queued = stats.total - stats.done - stats.running
+        if stats.running:
+            parts.append(f"{stats.running} running")
+        if queued > 0:
+            parts.append(f"{queued} queued")
+        if stats.failed:
+            parts.append(f"{stats.failed} failed")
+        if stats.retries:
+            parts.append(f"{stats.retries} retried")
+        parts.append(self._format_elapsed(stats.elapsed()))
+        return (
+            f"Generating candidate answers: {stats.done}/{stats.total} "
+            f"({', '.join(parts)})"
+        )
+
+    def _start_heartbeat(
+        self,
+        emitter: Optional[Callable[[dict], Awaitable[None]]],
+        render: Callable[[], str],
+    ) -> "Optional[asyncio.Task]":
+        """Start a ticker that re-emits render() on an interval.
+
+        Keeps long waits visibly ticking instead of looking frozen. Returns
+        None when progress events are disabled.
+        """
+        if emitter is None:
+            return None
+        return asyncio.create_task(self._heartbeat_loop(emitter, render))
+
+    async def _heartbeat_loop(
+        self,
+        emitter: Callable[[dict], Awaitable[None]],
+        render: Callable[[], str],
+    ) -> None:
+        while True:
+            await asyncio.sleep(self.valves.PROGRESS_INTERVAL_SECONDS)
+            await self._emit_status(emitter, render(), done=False)
+
+    @staticmethod
+    async def _cancel_tasks(tasks: "list[Optional[asyncio.Task]]") -> None:
+        """Cancel and reap the given tasks (None entries are skipped)."""
+        pending = [task for task in tasks if task is not None]
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _effective_min(self) -> int:
         """MIN_SUCCESSFUL_RESPONSES clamped to [1, CANDIDATE_COUNT]."""

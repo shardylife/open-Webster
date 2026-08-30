@@ -46,7 +46,8 @@ connection already serves the target model.
 | `CANDIDATE_MAX_TOKENS` | *(unset)* | `max_tokens` for candidates; empty uses the provider default. |
 | `SYNTHESIS_MAX_TOKENS` | *(unset)* | `max_tokens` for synthesis. |
 | `MAX_CANDIDATE_CHARACTERS` | `8000` | Per-candidate cap when quoting answers into the synthesis prompt. |
-| `SHOW_PROGRESS` | `true` | Emit status events (`Generating candidate answers: 6/10`, …). |
+| `SHOW_PROGRESS` | `true` | Emit status events (`Generating candidate answers: 6/10 (3 running, 1m 05s)`, …). |
+| `PROGRESS_INTERVAL_SECONDS` | `2` | Seconds between liveness heartbeats — elapsed time plus running/queued/failed/retried counts — so long waits visibly tick instead of looking frozen. |
 
 ## Safety properties
 
