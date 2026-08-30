@@ -1,8 +1,8 @@
 """
 title: Production Prompt Enhancer
 author: bezz
-version: 4.11.0
-description: Intent-aware LLM-based filter that enhances user prompts for better responses. Enhancement is opt-in per message via an activation prefix (!! by default — only prefixed messages are enhanced, and the prefix is stripped before sending; a legacy 'bypass' mode inverts this to always-on). !!on / !!off toggle automatic enhancement for the current chat, and users can override the mode for themselves via a per-user valve. Inline per-message flags (!!d,show: prompt) override style, force the comparison card, or skip the cache (fresh also retries a paused enhancer); !!help shows a command card. A failure circuit breaker pauses enhancement after repeated LLM failures so users never pay serial timeouts. Also features per-user overrides, context-aware TTL caching (optionally shared across users), request coalescing, config-driven intents, enhancement style modes, opt-in Socratic mode (asks one clarifying question when a prompt is too vague to enhance), model skip-lists, LLM timeouts, image-aware enhancement, multilingual skip heuristics (EN/ES/FR/DE/PT/IT + CJK), admin !!stats / !!stats reset commands (with last-failure readout), an admin !!test self-test that round-trips the configured enhancer model and reports latency, an optional expansion guard, original-prompt preservation, and smart skip logic (including already-well-structured prompts).
+version: 4.12.0
+description: Intent-aware LLM-based filter that enhances user prompts for better responses. Ships as a toggle button in the chat input (click the sparkle chip to enhance every message in that chat; click again to turn it off — set the ui_toggle_button valve to False and re-save the function for the always-active prefix workflow instead). Enhancement is otherwise opt-in per message via an activation prefix (!! by default — only prefixed messages are enhanced, and the prefix is stripped before sending; a legacy 'bypass' mode inverts this to always-on). !!on / !!off toggle automatic enhancement for the current chat, and users can override the mode for themselves via a per-user valve. Inline per-message flags (!!d,show: prompt) override style, force the comparison card, or skip the cache (fresh also retries a paused enhancer); !!help shows a command card. A failure circuit breaker pauses enhancement after repeated LLM failures so users never pay serial timeouts. Also features per-user overrides, context-aware TTL caching (optionally shared across users), request coalescing, config-driven intents, enhancement style modes, opt-in Socratic mode (asks one clarifying question when a prompt is too vague to enhance), model skip-lists, LLM timeouts, image-aware enhancement, multilingual skip heuristics (EN/ES/FR/DE/PT/IT + CJK), admin !!stats / !!stats reset commands (with last-failure readout), an admin !!test self-test that round-trips the configured enhancer model and reports latency, an optional expansion guard, original-prompt preservation, and smart skip logic (including already-well-structured prompts).
 required_open_webui_version: 0.9.1
 """
 
@@ -1978,6 +1978,18 @@ def _build_comparison_embed(
 # Filter
 # ---------------------------------------------------------------------------
 
+# Sparkles icon for the chat-input toggle chip (data-URI SVG; the frontend
+# inverts it in dark mode).
+_TOGGLE_ICON = (
+    "data:image/svg+xml;base64,"
+    "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAy"
+    "NCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJibGFjayIgc3Ryb2tlLXdpZHRoPSIxLjgiIHN0"
+    "cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0i"
+    "TTEyIDNsMS44IDUuMkwxOSAxMGwtNS4yIDEuOEwxMiAxN2wtMS44LTUuMkw1IDEwbDUuMi0x"
+    "Ljh6Ii8+PHBhdGggZD0iTTE5IDE1bC45IDIuNiAyLjYuOS0yLjYuOUwxOSAyMmwtLjktMi42"
+    "LTIuNi0uOSAyLjYtLjl6Ii8+PC9zdmc+"
+)
+
 
 class Filter:
     class Valves(BaseModel):
@@ -1988,6 +2000,20 @@ class Filter:
         enabled: bool = Field(
             default=True,
             description="Master on/off switch.",
+        )
+        ui_toggle_button: bool = Field(
+            default=True,
+            description=(
+                "Show this filter as a toggle button (sparkle chip) in the "
+                "chat input. When the button is ON for a chat, every message "
+                "in it is enhanced automatically ('!!' still adds flags and "
+                "commands); when OFF, the filter does not run at all — "
+                "including prefix commands. Set to False for the "
+                "always-active prefix workflow. NOTE: Open WebUI reads the "
+                "button setting when the function is saved, so after changing "
+                "this valve, re-save the function (Admin → Functions → edit → "
+                "Save) for the button to appear or disappear."
+            ),
         )
         model_id: Optional[str] = Field(
             default=None,
@@ -2313,7 +2339,23 @@ class Filter:
         )
 
     def __init__(self) -> None:
+        self.icon = _TOGGLE_ICON
+        # self.toggle drives Open WebUI's chat-input toggle chip; it must be
+        # set before valves so the property setter below can sync it.
+        self.toggle = self.Valves().ui_toggle_button
         self.valves = self.Valves()
+
+    # Open WebUI assigns fresh Valves onto the instance on every processed
+    # request (apply_filter_valves), so routing the assignment through a
+    # property keeps self.toggle in sync with the ui_toggle_button valve.
+    @property
+    def valves(self) -> "Filter.Valves":
+        return self._valves
+
+    @valves.setter
+    def valves(self, value: "Filter.Valves") -> None:
+        self._valves = value
+        self.toggle = bool(getattr(value, "ui_toggle_button", False))
 
     # ------------------------------------------------------------------
     # Event emission (safe when no emitter is provided)
@@ -2559,9 +2601,15 @@ class Filter:
         """
         prefix = self.valves.prefix.strip()
         activate = mode == "activate"
-        # Chat override changes the automatic (unprefixed) behavior only.
+        # Button mode: when the filter runs as a chat-input toggle, running at
+        # all means the user clicked it ON for this chat — so unprefixed
+        # messages are enhanced automatically. A '!!on'/'!!off' chat override
+        # still wins over both the button default and the configured mode.
+        button_mode = bool(getattr(self, "toggle", False))
         override = _chat_toggles.get(chat_id) if self.valves.enable_chat_toggle else None
-        auto_enhance = override if override is not None else not activate
+        auto_enhance = (
+            override if override is not None else (button_mode or not activate)
+        )
         passthrough = _PrefixOutcome(text=user_message) if auto_enhance else None
 
         if not prefix:

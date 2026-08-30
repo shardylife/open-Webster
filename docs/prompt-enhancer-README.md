@@ -4,7 +4,7 @@ An Open WebUI **filter function** that rewrites user prompts into clearer,
 more specific requests before they reach the chat model — opt-in per message,
 per chat, per user, or instance-wide.
 
-- **File:** [`prompt_enhancer.py`](./prompt_enhancer.py) (single file, v4.11.0)
+- **File:** [`prompt_enhancer.py`](./prompt_enhancer.py) (single file, v4.12.0)
 - **Requires:** Open WebUI ≥ 0.9.1 (verified against 0.11.x)
 - **Code review:** [`prompt-enhancer-review.md`](./prompt-enhancer-review.md)
 
@@ -15,12 +15,21 @@ per chat, per user, or instance-wide.
 3. Enable it globally or attach it to specific models (model settings →
    filters).
 
-No other setup is needed. By default nothing changes until someone opts in
-with the prefix.
+No other setup is needed. By default nothing changes until someone turns the
+toggle button on or opts in with the prefix.
 
-## Quick start
+## Quick start — the toggle button
 
-Type `!!` in front of any message to enhance it:
+By default the filter appears as a **sparkle toggle chip in the chat input**
+(next to Web Search and the other integrations). Click it ON and every
+message in that chat is enhanced automatically; click it OFF and the filter
+doesn't run at all. While the button is ON, the `!!` prefix still gives you
+flags, styles, and commands (see below).
+
+Prefer the keyboard-only workflow? Set the `ui_toggle_button` valve to
+`False` and **re-save the function** (Open WebUI reads the button setting at
+save time). The filter is then always active and enhancement is driven
+purely by the prefix:
 
 ```
 !!write a launch plan for our new API
@@ -50,6 +59,8 @@ untouched.
 
 A header is treated as flags only when *every* token before the colon is a
 known flag — `!!Summarize this: my notes` enhances the whole text untouched.
+In toggle-button mode, commands and the prefix only work while the chip is
+ON for the chat (an OFF chip means Open WebUI never invokes the filter).
 
 ## The control hierarchy
 
@@ -57,9 +68,10 @@ Enhancement can be controlled at four levels; the more specific level wins:
 
 1. **Per message** — the `!!` prefix (and its flags) always means "enhance
    this" in activate mode, "don't enhance this" in bypass mode.
-2. **Per chat** — `!!on` / `!!off` override the automatic behavior for
-   unprefixed messages in that chat (in-memory, 24h TTL; resets on restart
-   and is per worker process).
+2. **Per chat** — the toggle button in the chat input (when
+   `ui_toggle_button` is on, the default), and/or `!!on` / `!!off`, which
+   override the automatic behavior for unprefixed messages in that chat
+   (in-memory, 24h TTL; resets on restart and is per worker process).
 3. **Per user** — the `prefix_mode` user valve lets an individual run
    `bypass` (always-on) while the instance default stays `activate`, or vice
    versa. Users can also disable the filter entirely, pick a default style,
@@ -110,6 +122,7 @@ For each triggered message, the filter:
 
 | Valve | Default | What it does |
 |---|---|---|
+| `ui_toggle_button` | on | Show the filter as a toggle chip in the chat input (re-save the function after changing) |
 | `prefix` / `prefix_mode` | `!!` / `activate` | The trigger prefix and whether it opts in or out |
 | `model_id` | *(chat model)* | Dedicated enhancement model |
 | `enhancement_style` | `standard` | `concise` / `standard` / `detailed` |
