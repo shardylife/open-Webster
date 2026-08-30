@@ -1,8 +1,8 @@
 """
 title: Production Prompt Enhancer
 author: bezz
-version: 4.10.0
-description: Intent-aware LLM-based filter that enhances user prompts for better responses. Enhancement is opt-in per message via an activation prefix (!! by default — only prefixed messages are enhanced, and the prefix is stripped before sending; a legacy 'bypass' mode inverts this to always-on). !!on / !!off toggle automatic enhancement for the current chat, and users can override the mode for themselves via a per-user valve. Inline per-message flags (!!d,show: prompt) override style, force the comparison card, or skip the cache (fresh also retries a paused enhancer); !!help shows a command card. A failure circuit breaker pauses enhancement after repeated LLM failures so users never pay serial timeouts. Also features per-user overrides, context-aware TTL caching (optionally shared across users), request coalescing, config-driven intents, enhancement style modes, opt-in Socratic mode (asks one clarifying question when a prompt is too vague to enhance), model skip-lists, LLM timeouts, image-aware enhancement, multilingual skip heuristics (EN/ES/FR/DE/PT/IT + CJK), admin !!stats / !!stats reset commands (with last-failure readout), an optional expansion guard, original-prompt preservation, and smart skip logic (including already-well-structured prompts).
+version: 4.11.0
+description: Intent-aware LLM-based filter that enhances user prompts for better responses. Enhancement is opt-in per message via an activation prefix (!! by default — only prefixed messages are enhanced, and the prefix is stripped before sending; a legacy 'bypass' mode inverts this to always-on). !!on / !!off toggle automatic enhancement for the current chat, and users can override the mode for themselves via a per-user valve. Inline per-message flags (!!d,show: prompt) override style, force the comparison card, or skip the cache (fresh also retries a paused enhancer); !!help shows a command card. A failure circuit breaker pauses enhancement after repeated LLM failures so users never pay serial timeouts. Also features per-user overrides, context-aware TTL caching (optionally shared across users), request coalescing, config-driven intents, enhancement style modes, opt-in Socratic mode (asks one clarifying question when a prompt is too vague to enhance), model skip-lists, LLM timeouts, image-aware enhancement, multilingual skip heuristics (EN/ES/FR/DE/PT/IT + CJK), admin !!stats / !!stats reset commands (with last-failure readout), an admin !!test self-test that round-trips the configured enhancer model and reports latency, an optional expansion guard, original-prompt preservation, and smart skip logic (including already-well-structured prompts).
 required_open_webui_version: 0.9.1
 """
 
@@ -1824,6 +1824,7 @@ def _help_embed_html(
     rows.append((f"{prefix}help", "Show this help"))
     if is_admin:
         rows.append((f"{prefix}stats / {prefix}stats reset", "Runtime counters / reset (admin)"))
+        rows.append((f"{prefix}test", "Round-trip the enhancer model and report latency (admin)"))
 
     cells = "".join(
         '<div style="padding:8px 16px;display:flex;justify-content:space-between;'
@@ -1846,6 +1847,39 @@ def _help_embed_html(
         'opacity:0.7;text-transform:uppercase;letter-spacing:0.5px;">'
         "Prompt Enhancer — Commands</div>"
         f"{cells}{footer}</div>"
+    )
+
+
+def _selftest_embed_html(
+    model: str, elapsed_ms: int, preview: str, breaker_cleared: bool
+) -> str:
+    rows: tuple[tuple[str, str], ...] = (
+        ("Model", model),
+        ("Round-trip", f"{elapsed_ms} ms"),
+        ("Output", f"{len(preview)} chars (preview below)"),
+        ("Circuit breaker", "cleared" if breaker_cleared else "closed"),
+    )
+    cells = "".join(
+        '<div style="padding:8px 16px;display:flex;justify-content:space-between;'
+        'border-bottom:1px solid rgba(128,128,128,0.12);">'
+        f'<span style="opacity:0.65;">{_escape_html(label)}</span>'
+        f"<strong>{_escape_html(value)}</strong></div>"
+        for label, value in rows
+    )
+    preview_html = (
+        '<div style="padding:10px 16px;font-size:12px;opacity:0.75;'
+        'white-space:pre-wrap;">'
+        f"{_escape_html(_clamp_for_display(preview, 400))}</div>"
+    )
+    return (
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;'
+        "border:1px solid rgba(16,185,129,0.4);border-radius:12px;overflow:hidden;"
+        'margin:8px 0;font-size:13px;color:inherit;">'
+        '<div style="background:rgba(16,185,129,0.12);padding:8px 16px;'
+        "border-bottom:1px solid rgba(128,128,128,0.2);font-size:11px;font-weight:600;"
+        'opacity:0.8;text-transform:uppercase;letter-spacing:0.5px;">'
+        "Prompt Enhancer — Self-Test Passed</div>"
+        f"{cells}{preview_html}</div>"
     )
 
 
@@ -2503,6 +2537,8 @@ class Filter:
         emitter: Optional[Callable[[Any], Awaitable[None]]],
         mode: str,
         chat_id: str,
+        model_info: Optional[dict] = None,
+        request: Optional[Request] = None,
     ) -> Optional[_PrefixOutcome]:
         """Apply the per-message prefix, inline flags, and utility commands.
 
@@ -2560,6 +2596,14 @@ class Filter:
             # Abort the request so the command never reaches the model;
             # the exception text doubles as a plain-text stats readout.
             raise RuntimeError(f"{label} — {_stats_summary()}")
+
+        if command == "test":
+            if not is_admin:
+                raise RuntimeError(
+                    f"Prompt Enhancer: '{prefix}test' is admin-only. "
+                    f"Send '{prefix}help' for available commands."
+                )
+            await self._run_selftest(body, model_info, request, user_info, emitter)
 
         if command in ("on", "off") and self.valves.enable_chat_toggle:
             if not chat_id:
@@ -2643,6 +2687,79 @@ class Filter:
             style_override=style_override,
             force_embed=force_embed,
             skip_cache=skip_cache,
+        )
+
+    async def _run_selftest(
+        self,
+        body: dict,
+        model_info: Optional[dict],
+        request: Optional[Request],
+        user_info: Optional[dict],
+        emitter: Optional[Callable[[Any], Awaitable[None]]],
+    ) -> None:
+        """Round-trip the configured enhancer model with a fixed sample prompt.
+
+        Admin diagnostic ('<prefix>test'): verifies the model is resolvable
+        and reachable, measures real latency through the same code path
+        ordinary enhancements use, and reports the cleaned output. A passing
+        test clears the circuit breaker — the natural "I fixed the config,
+        unblock it" flow. Always raises so the command never reaches the
+        chat model.
+        """
+        model = _resolve_model(self.valves.model_id, model_info, body)
+        if not model:
+            raise RuntimeError(
+                "Prompt Enhancer self-test FAILED: no enhancer model could be "
+                "resolved (set the model_id valve or test from a normal chat)."
+            )
+
+        user = await self._lookup_user(user_info)
+        sample = "Explain how photosynthesis works"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": BASE_SYSTEM_PROMPT},
+                {"role": "user", "content": _build_user_prompt(sample, "")},
+            ],
+            "stream": False,
+            "temperature": self.valves.temperature,
+        }
+
+        started = time.perf_counter()
+        raw = await self._call_llm(request, payload, user)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+        if raw is _TIMED_OUT:
+            _STATS.note_failure("self-test: timed out")
+            raise RuntimeError(
+                "Prompt Enhancer self-test FAILED: model "
+                f"'{model}' timed out after "
+                f"{self.valves.llm_timeout_seconds:.0f}s."
+            )
+        if raw is None:
+            _STATS.note_failure("self-test: model call failed")
+            raise RuntimeError(
+                f"Prompt Enhancer self-test FAILED: call to model '{model}' "
+                "failed — check the server logs for the underlying error."
+            )
+        cleaned = _clean_llm_output(str(raw))
+        if not cleaned.strip():
+            _STATS.note_failure("self-test: empty output")
+            raise RuntimeError(
+                f"Prompt Enhancer self-test FAILED: model '{model}' answered "
+                "but produced empty output after cleaning."
+            )
+
+        breaker_cleared = _breaker.remaining() > 0
+        _breaker.record_success()
+        await self._emit_html(
+            emitter, _selftest_embed_html(model, elapsed_ms, cleaned, breaker_cleared)
+        )
+        raise RuntimeError(
+            f"Prompt Enhancer self-test PASSED — model '{model}', "
+            f"{elapsed_ms} ms, {len(cleaned)} chars"
+            + (", circuit breaker cleared" if breaker_cleared else "")
+            + "."
         )
 
     async def _apply_socratic(
@@ -2769,6 +2886,8 @@ class Filter:
             __event_emitter__,
             mode=self._effective_mode(user_valves),
             chat_id=self._resolve_chat_id(__metadata__, __chat_id__),
+            model_info=__model__,
+            request=__request__,
         )
         if prefixed is None:
             return body
