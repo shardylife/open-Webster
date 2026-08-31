@@ -184,6 +184,7 @@ sys.modules["consensus_10_pipe"] = consensus_10_pipe
 _spec.loader.exec_module(consensus_10_pipe)
 Pipe = consensus_10_pipe.Pipe
 MANAGER_MARK = consensus_10_pipe._MANAGER_MARK
+SUMMARY_MARKER = consensus_10_pipe._SUMMARY_MARKER
 
 # ----------------------------------------------------------------------
 # Test helpers
@@ -674,11 +675,82 @@ def test_only_successful_answers_reach_synthesis():
 def test_final_answer_is_synthesis_not_a_candidate():
     async def scenario():
         result = await call_pipe(make_pipe())
+        # no marker in the default reply -> passthrough, no details block
         assert result == "SYNTH-FINAL"
         candidate_texts = {
             f"candidate-{c.candidate_no}" for c in BACKEND.calls if not c.is_synthesis
         }
         assert result not in candidate_texts
+
+    run(scenario())
+
+
+# ----------------------------------------------------------------------
+# Synthesis summary
+# ----------------------------------------------------------------------
+
+
+def test_synthesis_summary_rendered_as_collapsible_section():
+    async def scenario():
+        async def impl(call):
+            if call.is_synthesis:
+                return ok_response(
+                    "FINAL-ANSWER\n\n"
+                    f"{SUMMARY_MARKER}\n"
+                    "- compared 2 drafts, both agreed on the result\n"
+                    "- kept draft 2's edge-case note"
+                )
+            if call.is_manager:
+                return ok_response(default_plan())
+            return ok_response(f"candidate-{call.candidate_no}")
+
+        BACKEND.impl = impl
+        result = await call_pipe(make_pipe(CANDIDATE_COUNT=2))
+        assert result.startswith("FINAL-ANSWER")
+        assert SUMMARY_MARKER not in result  # marker is consumed, not shown
+        assert "<details>" in result and "</details>" in result
+        assert "How this answer was assembled" in result
+        assert "- kept draft 2's edge-case note" in result
+        # the summary instruction was actually sent to the synthesis call
+        synthesis_system = BACKEND.calls[-1].form["messages"][0]["content"]
+        assert SUMMARY_MARKER in synthesis_system
+
+    run(scenario())
+
+
+def test_synthesis_summary_can_be_disabled():
+    async def scenario():
+        async def impl(call):
+            if call.is_synthesis:
+                return ok_response(f"FINAL\n\n{SUMMARY_MARKER}\n- stray summary")
+            if call.is_manager:
+                return ok_response(default_plan())
+            return ok_response(f"candidate-{call.candidate_no}")
+
+        BACKEND.impl = impl
+        pipe = make_pipe(CANDIDATE_COUNT=2, SHOW_SYNTHESIS_SUMMARY=False)
+        result = await call_pipe(pipe)
+        assert result == "FINAL"  # stray marker section stripped, no details
+        synthesis_system = BACKEND.calls[-1].form["messages"][0]["content"]
+        assert SUMMARY_MARKER not in synthesis_system  # never asked for one
+
+    run(scenario())
+
+
+def test_degenerate_summary_only_output_returned_raw():
+    async def scenario():
+        async def impl(call):
+            if call.is_synthesis:
+                # marker first would leave an empty visible answer; the pipe
+                # must fall back to the raw text instead of returning nothing
+                return ok_response(f"{SUMMARY_MARKER}\n- summary with no answer")
+            if call.is_manager:
+                return ok_response(default_plan())
+            return ok_response(f"candidate-{call.candidate_no}")
+
+        BACKEND.impl = impl
+        result = await call_pipe(make_pipe(CANDIDATE_COUNT=2))
+        assert result == f"{SUMMARY_MARKER}\n- summary with no answer"
 
     run(scenario())
 

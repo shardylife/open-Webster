@@ -1,7 +1,7 @@
 """
 title: Consensus-10
 author: shardylife
-version: 1.2.0
+version: 1.3.0
 license: MIT
 required_open_webui_version: 0.5.0
 description: 1 manager + 10 concurrent + 1 synthesis generations of one base model per turn (12 total).
@@ -77,6 +77,10 @@ _ALLOWED_ROLES = frozenset({"system", "user", "assistant"})
 _DRAFT_BEGIN = "--- BEGIN DRAFT ANSWER"
 _DRAFT_END = "--- END DRAFT ANSWER"
 
+# Delimiter the synthesis call places between the answer and its own summary
+# of what it did; everything after it is re-rendered as a collapsed section.
+_SUMMARY_MARKER = "===CONSENSUS SUMMARY==="
+
 _SYNTHESIS_SYSTEM_PROMPT = """You are writing the single final answer to the conversation above.
 You have been given several independently written draft answers to the same request; they appear
 only in the final user message, wrapped between BEGIN/END markers.
@@ -101,6 +105,16 @@ Follow these rules exactly:
    process. Do not explain how the answer was produced.
 8. Respond as if you are simply the assistant answering the conversation directly: one polished,
    standalone answer with no meta-commentary."""
+
+_SYNTHESIS_SUMMARY_INSTRUCTION = f"""
+
+Exception to rules 7 and 8: AFTER the complete final answer, append a line containing exactly
+{_SUMMARY_MARKER}
+followed by 3-5 short markdown bullets summarizing what you did: how many drafts you compared
+and where they agreed, which disagreements you resolved and how, any minority insight you kept,
+and what you discarded and why. Keep it under 120 words, do not quote drafts at length, and do
+not reveal step-by-step reasoning. This section is displayed separately from the answer, which
+must remain complete and self-contained without it."""
 
 _SYNTHESIS_TASK_TEMPLATE = (
     "Below are {count} independently generated draft answers to my request above, "
@@ -275,6 +289,15 @@ class Pipe:
             ge=1,
             description="max_tokens for the manager planning generation (empty = provider default).",
         )
+        SHOW_SYNTHESIS_SUMMARY: bool = Field(
+            default=True,
+            description=(
+                "Ask the synthesis call to also report what it did "
+                "(agreements, resolved conflicts, kept minority insights, "
+                "discarded material), shown as a collapsible section under "
+                "the final answer."
+            ),
+        )
         MAX_CANDIDATE_CHARACTERS: int = Field(
             default=8000,
             ge=200,
@@ -413,6 +436,9 @@ class Pipe:
                     f"{self._sanitize_error(exc)}"
                 ) from None
 
+            final_answer = self._format_final_answer(
+                final_answer, valves.SHOW_SYNTHESIS_SUMMARY
+            )
             await self._emit_status(
                 emitter,
                 f"Consensus complete: synthesized {len(answers)} candidate answers "
@@ -776,12 +802,39 @@ class Pipe:
         synthesis_task = _SYNTHESIS_TASK_TEMPLATE.format(
             count=len(answers), blocks="\n\n".join(blocks)
         )
+        system_prompt = _SYNTHESIS_SYSTEM_PROMPT
+        if valves.SHOW_SYNTHESIS_SUMMARY:
+            system_prompt += _SYNTHESIS_SUMMARY_INSTRUCTION
         form_data["messages"] = [
-            {"role": "system", "content": _SYNTHESIS_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             *conversation,
             {"role": "user", "content": synthesis_task},
         ]
         return form_data
+
+    @staticmethod
+    def _format_final_answer(raw_answer: str, include_summary: bool) -> str:
+        """Split off the synthesis summary and render it as a collapsed block.
+
+        The synthesis call is asked to append its account of what it did
+        after _SUMMARY_MARKER; here that part becomes a collapsible
+        <details> section under the answer. Missing or malformed markers
+        degrade gracefully - the text is returned as-is rather than ever
+        losing the visible answer.
+        """
+        if _SUMMARY_MARKER not in raw_answer:
+            return raw_answer
+        answer, summary = raw_answer.split(_SUMMARY_MARKER, 1)
+        answer, summary = answer.strip(), summary.strip()
+        if not answer:
+            return raw_answer
+        if not include_summary or not summary:
+            return answer
+        return (
+            f"{answer}\n\n<details>\n"
+            f"<summary>How this answer was assembled</summary>\n\n"
+            f"{summary}\n\n</details>"
+        )
 
     # ------------------------------------------------------------------
     # Helpers

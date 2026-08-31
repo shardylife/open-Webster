@@ -7,8 +7,11 @@ cases, counterarguments, …), then sends your entire conversation to
 **10 concurrent generations** of one configured base model — each steered by
 its assigned angle — and finally makes a **synthesis call to the same model**
 that compares the drafts and writes the single strongest reply. Only that
-synthesized reply appears in the chat; the intermediate answers are never
-shown or saved. If the manager call fails or returns nothing usable, the
+synthesized reply appears in the chat — followed by a collapsible
+**"How this answer was assembled"** note in which the synthesizer briefly
+reports where drafts agreed, which conflicts it resolved, and what it
+discarded (`SHOW_SYNTHESIS_SUMMARY=false` hides it). The intermediate answers
+themselves are never shown or saved. If the manager call fails or returns nothing usable, the
 candidates fall back to sampling the identical prompt (`ENABLE_MANAGER=false`
 forces that mode permanently).
 
@@ -53,6 +56,7 @@ connection already serves the target model.
 | `CANDIDATE_MAX_TOKENS` | *(unset)* | `max_tokens` for candidates; empty uses the provider default. |
 | `SYNTHESIS_MAX_TOKENS` | *(unset)* | `max_tokens` for synthesis. |
 | `MANAGER_MAX_TOKENS` | *(unset)* | `max_tokens` for the manager planning call. |
+| `SHOW_SYNTHESIS_SUMMARY` | `true` | Append a collapsible "How this answer was assembled" note: agreements, resolved conflicts, kept minority insights, discarded material. |
 | `MAX_CANDIDATE_CHARACTERS` | `8000` | Per-candidate cap when quoting answers into the synthesis prompt. |
 | `SHOW_PROGRESS` | `true` | Emit status events (`Generating candidate answers: 6/10 (3 running, 1m 05s)`, …). |
 | `PROGRESS_INTERVAL_SECONDS` | `2` | Seconds between liveness heartbeats — elapsed time plus running/queued/failed/retried counts — so long waits visibly tick instead of looking frozen. |
@@ -95,7 +99,7 @@ python3 -m py_compile extensions/consensus-10/consensus_10_pipe.py \
 python3 -m pytest -q extensions/consensus-10/test_consensus_10_pipe.py
 ```
 
-The suite (31 tests) is deterministic and hermetic: `open_webui` is stubbed
+The suite (34 tests) is deterministic and hermetic: `open_webui` is stubbed
 with an in-process mock completion backend, concurrency is proven with
 barriers rather than sleeps, and no network or running Open WebUI instance is
 required.
